@@ -9,6 +9,7 @@
 - **Emotes coloridos:** 1.715 emojis com busca em português.
 - **Prints:** janela ativa ou tela inteira, inclusive em jogos. Vão para `Imagens\PRINTS` e para a área de transferência.
 - **Salvar imagem como arquivo:** PNG, JPG ou BMP.
+- **Editor de imagem:** tela cheia, com lápis, marca-texto, borracha, borrar, setas, retângulos, texto, recorte e outra imagem por cima. Abra com o botão **Editar**, `Ctrl + E` ou dois cliques na prévia. O que for borrado é substituído na própria imagem, sem como recuperar no arquivo final.
 - **Atalhos configuráveis**, início junto com o Windows e opção de colar sozinho.
 
 | Ação | Atalho padrão |

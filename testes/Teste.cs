@@ -47,6 +47,251 @@ static class Teste
         if (!c) falhas++;
     }
 
+    // ---- Editor de imagem ----
+    static Bitmap Listras(int w, int h)
+    {
+        Bitmap b = new Bitmap(w, h, PixelFormat.Format32bppArgb);
+        using (Graphics g = Graphics.FromImage(b))
+        {
+            g.Clear(Color.White);
+            for (int x = 0; x < w; x += 6) g.FillRectangle(Brushes.Black, x, 0, 3, h);
+        }
+        return b;
+    }
+
+    static bool Iguais(Bitmap a, Bitmap b)
+    {
+        if (a.Width != b.Width || a.Height != b.Height) return false;
+        for (int y = 0; y < a.Height; y += 3)
+            for (int x = 0; x < a.Width; x += 3)
+                if (a.GetPixel(x, y).ToArgb() != b.GetPixel(x, y).ToArgb()) return false;
+        return true;
+    }
+
+    static T Achar<T>(Control c) where T : Control
+    {
+        foreach (Control f in c.Controls)
+        {
+            T t = f as T;
+            if (t != null) return t;
+            t = Achar<T>(f);
+            if (t != null) return t;
+        }
+        return null;
+    }
+
+    static Label AcharBotao(Control c, string texto)
+    {
+        foreach (Control f in c.Controls)
+        {
+            if (f is Label && f.Text == texto) return (Label)f;
+            Label l = AcharBotao(f, texto);
+            if (l != null) return l;
+        }
+        return null;
+    }
+
+    static IntPtr Pos(Point p) { return new IntPtr((p.Y << 16) | (p.X & 0xFFFF)); }
+
+    static void Arrastar(Control c, Point de, Point ate)
+    {
+        Nativo.SendMessage(c.Handle, 0x0201, new IntPtr(1), Pos(de));
+        Nativo.SendMessage(c.Handle, 0x0200, new IntPtr(1), Pos(new Point((de.X + ate.X) / 2, (de.Y + ate.Y) / 2)));
+        Nativo.SendMessage(c.Handle, 0x0200, new IntPtr(1), Pos(ate));
+        Nativo.SendMessage(c.Handle, 0x0202, IntPtr.Zero, Pos(ate));
+        Application.DoEvents();
+    }
+
+    static void FotoForm(Form f, string caminho)
+    {
+        using (Bitmap foto = new Bitmap(f.Width, f.Height))
+        {
+            f.DrawToBitmap(foto, new Rectangle(0, 0, f.Width, f.Height));
+            foto.Save(caminho, ImageFormat.Png);
+        }
+    }
+
+    static void TestarEditor(string saida)
+    {
+        // Pixels e desfazer
+        using (Bitmap orig = Listras(300, 200))
+        using (Quadro q = new Quadro(orig))
+        {
+            Ok(!q.Alterado && !q.PodeDesfazer, "quadro novo sem alteracao");
+
+            q.ComecarTraco(Ferramenta.Lapis, Color.Red, 8, new PointF(30, 30));
+            q.MoverTraco(new PointF(120, 90));
+            q.TerminarTraco();
+            Ok(q.Imagem.GetPixel(75, 60).R > 200 && q.Imagem.GetPixel(75, 60).G < 60, "lapis pinta");
+            Ok(q.Alterado && q.PodeDesfazer, "lapis marca alteracao");
+
+            q.Desfazer();
+            Ok(Iguais(q.Imagem, orig), "desfazer volta exatamente");
+            Ok(!q.Alterado, "desfazer tudo limpa a alteracao");
+            q.Refazer();
+            Ok(q.Imagem.GetPixel(75, 60).R > 200 && q.Alterado, "refazer repete");
+            q.Desfazer();
+
+            // clique simples
+            q.ComecarTraco(Ferramenta.Lapis, Color.Lime, 10, new PointF(200, 100));
+            q.TerminarTraco();
+            Ok(q.Imagem.GetPixel(200, 100).G > 200, "clique sem arrastar marca");
+            q.Desfazer();
+
+            // borracha
+            q.ComecarTraco(Ferramenta.Borracha, Color.Red, 20, new PointF(50, 50));
+            q.MoverTraco(new PointF(100, 50));
+            q.TerminarTraco();
+            Ok(q.Imagem.GetPixel(75, 50).A == 0, "borracha deixa transparente");
+            Ok(q.Imagem.GetPixel(75, 120).A == 255, "borracha nao passa do traco");
+            q.Desfazer();
+            Ok(Iguais(q.Imagem, orig), "desfazer borracha");
+
+            // borrar: as listras nao podem mais ser lidas
+            q.ComecarTraco(Ferramenta.BorrarArea, Color.Red, 8, new PointF(20, 20));
+            q.MoverTraco(new PointF(280, 180));
+            q.TerminarTraco();
+            int menor = 255, maior = 0;
+            for (int x = 100; x < 160; x++) { int v = q.Imagem.GetPixel(x, 100).R; menor = Math.Min(menor, v); maior = Math.Max(maior, v); }
+            Ok(maior - menor < 60, "borrar some com o padrao (variacao " + (maior - menor) + ")");
+            string borrada = Path.Combine(saida, "borrada.png");
+            q.Imagem.Save(borrada, ImageFormat.Png);
+            using (Bitmap salva = new Bitmap(borrada))
+            {
+                int s1 = 255, s2 = 0;
+                for (int x = 100; x < 160; x++) { int v = salva.GetPixel(x, 100).R; s1 = Math.Min(s1, v); s2 = Math.Max(s2, v); }
+                Ok(s2 - s1 < 60, "o arquivo salvo nao guarda o original");
+            }
+            q.Desfazer();
+            Ok(Iguais(q.Imagem, orig), "desfazer borrar");
+
+            // borrar com pincel
+            q.ComecarTraco(Ferramenta.Borrar, Color.Red, 40, new PointF(60, 100));
+            q.MoverTraco(new PointF(240, 100));
+            q.TerminarTraco();
+            Ok(!Iguais(q.Imagem, orig), "pincel de borrar muda a imagem");
+            q.Desfazer();
+
+            // cancelar e traco vazio
+            q.ComecarTraco(Ferramenta.Seta, Color.Red, 4, new PointF(30, 30));
+            q.MoverTraco(new PointF(200, 150));
+            q.CancelarTraco();
+            Ok(Iguais(q.Imagem, orig), "cancelar nao deixa rastro");
+            q.ComecarTraco(Ferramenta.Retangulo, Color.Red, 4, new PointF(30, 30));
+            q.TerminarTraco();
+            Ok(!q.PodeDesfazer, "clique com retangulo nao cria passo");
+
+            // formas redesenhadas nao deixam rastro do caminho
+            q.ComecarTraco(Ferramenta.Retangulo, Color.Red, 2, new PointF(10, 10));
+            q.MoverTraco(new PointF(280, 180));
+            q.MoverTraco(new PointF(60, 60));
+            q.TerminarTraco();
+            Ok(q.Imagem.GetPixel(280, 100).ToArgb() == orig.GetPixel(280, 100).ToArgb(), "forma nao deixa rastro");
+            q.Desfazer();
+
+            // recorte
+            Ok(q.Recortar(new Rectangle(10, 20, 100, 50)), "recorta");
+            Ok(q.Largura == 100 && q.Altura == 50, "tamanho do recorte");
+            q.ComecarTraco(Ferramenta.Lapis, Color.Red, 6, new PointF(20, 20));
+            q.MoverTraco(new PointF(80, 20));
+            q.TerminarTraco();
+            q.Desfazer();
+            q.Desfazer();
+            Ok(q.Largura == 300 && Iguais(q.Imagem, orig), "desfazer recorte devolve a imagem");
+            q.Refazer();
+            Ok(q.Largura == 100, "refazer recorte");
+            q.Desfazer();
+            Ok(!q.Recortar(new Rectangle(500, 500, 10, 10)), "recorte fora da imagem recusado");
+
+            // imagem por cima e texto
+            using (Bitmap sobre = new Bitmap(40, 40))
+            {
+                using (Graphics g = Graphics.FromImage(sobre)) g.Clear(Color.Blue);
+                q.Estampar(sobre, new RectangleF(100, 100, 80, 80));
+            }
+            Ok(q.Imagem.GetPixel(140, 140).B > 200 && q.Imagem.GetPixel(140, 140).R < 60, "imagem por cima");
+            q.Desfazer();
+            using (Font f = new Font("Segoe UI Semibold", 40, GraphicsUnit.Pixel)) q.Escrever("Oi", f, Color.Red, new PointF(20, 20));
+            Ok(!Iguais(q.Imagem, orig), "texto escreve");
+            q.Desfazer();
+            Ok(Iguais(q.Imagem, orig), "desfazer texto");
+
+            // limite de passos
+            for (int i = 0; i < 90; i++)
+            {
+                q.ComecarTraco(Ferramenta.Lapis, Color.Red, 4, new PointF(10 + i, 10));
+                q.TerminarTraco();
+            }
+            int n = 0;
+            while (q.Desfazer()) n++;
+            Ok(n == 60, "guarda 60 passos (" + n + ")");
+        }
+
+        // Copiar: confere o que chega na area de transferencia
+        string guardado = Clipboard.ContainsText() ? Clipboard.GetText() : null;
+        using (Bitmap b = Listras(50, 30)) Ok(App.CopiarEdicao(b, false), "copiar edicao");
+        Ok(Clipboard.ContainsImage(), "imagem na area de transferencia");
+        using (Image lida = Clipboard.GetImage()) Ok(lida != null && lida.Width == 50, "imagem copiada com o tamanho certo");
+        if (guardado != null) Clipboard.SetText(guardado); else Clipboard.Clear();
+
+        // Gravar nos tres formatos
+        foreach (string ext in new[] { ".png", ".jpg", ".bmp" })
+        {
+            string arq = Path.Combine(saida, "gravado" + ext);
+            using (Bitmap b = Listras(40, 40)) Historico.Gravar(b, arq);
+            using (Bitmap l = new Bitmap(arq)) Ok(l.Width == 40, "gravar " + ext);
+            File.Delete(arq);
+        }
+
+        // Janela de verdade, fora da area visivel, com cliques simulados
+        EditorImagem ed = new EditorImagem(Listras(1600, 900));
+        ed.Location = new Point(-6000, 0);
+        ed.Show();
+        Application.DoEvents();
+        ed.Ajustar();
+        Application.DoEvents();
+        FotoForm(ed, Path.Combine(saida, "editor.png"));
+        Console.WriteLine("janela do editor: " + ed.Width + "x" + ed.Height);
+
+        foreach (string nome in new[] { "Copiar", "Salvar como...", "Fechar", "Mover", "Recortar", "Imagem por cima" })
+        {
+            Label l = AcharBotao(ed, nome);
+            Ok(l != null && l.Right <= ed.Width && l.Left >= 0, "botao na tela: " + nome + (l == null ? "" : " x=" + l.Left));
+        }
+        Ok(AcharBotao(ed, "Imagem por cima").Right < AcharBotao(ed, "Copiar").Left, "botoes nao se sobrepoem");
+
+        TelaEditor tela = Achar<TelaEditor>(ed);
+        Ok(tela != null && tela.ClientSize.Width > 800 && tela.ClientSize.Height > 400, "tela de desenho ocupa o espaco");
+
+        Quadro q2 = null;
+        foreach (System.Reflection.FieldInfo fi in typeof(EditorImagem).GetFields(System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic))
+            if (fi.FieldType == typeof(Quadro)) q2 = (Quadro)fi.GetValue(ed);
+
+        Arrastar(tela, new Point(300, 200), new Point(600, 300));
+        FotoForm(ed, Path.Combine(saida, "editor-rabisco.png"));
+        Ok(q2.Alterado, "arrastar o mouse rabisca");
+        ed.Desfazer();
+        Ok(!q2.Alterado, "desfazer na janela");
+
+        ed.TrocarFerramenta(Ferramenta.Recortar);
+        Arrastar(tela, new Point(300, 200), new Point(800, 500));
+        Ok(q2.Largura < 1600, "recortar na janela (" + q2.Largura + "x" + q2.Altura + ")");
+        ed.Desfazer();
+        Ok(q2.Largura == 1600, "desfazer recorte na janela");
+
+        Bitmap solta = new Bitmap(200, 200);
+        using (Graphics g = Graphics.FromImage(solta)) g.Clear(Color.Blue);
+        ed.ColocarImagem(solta);
+        Application.DoEvents();
+        FotoForm(ed, Path.Combine(saida, "editor-imagem.png"));
+        Ok(!q2.Alterado, "imagem por cima fica solta ate fixar");
+        ed.TrocarFerramenta(Ferramenta.Lapis);
+        Ok(q2.Alterado, "trocar de ferramenta fixa a imagem");
+        ed.Desfazer();
+
+        ed.Dispose();
+    }
+
     public static void Rodar(string[] args)
     {
         string saida = args[0];
@@ -212,6 +457,8 @@ static class Teste
         Ok(de_novo != null, "emoji depois de liberar");
         if (de_novo != null) de_novo.Dispose();
         EmojiCor.Liberar();
+
+        TestarEditor(saida);
 
         Console.WriteLine(falhas == 0 ? "TUDO OK" : "FALHAS: " + falhas);
         Environment.Exit(falhas == 0 ? 0 : 1);

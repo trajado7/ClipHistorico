@@ -696,15 +696,28 @@ static class Historico
     {
         string ext = Path.GetExtension(destino).ToLowerInvariant();
         if (ext == ".png") { File.Copy(it.Caminho, destino, true); return; }
+        using (Bitmap img = LerImagem(it.Caminho)) Gravar(img, destino);
+    }
 
-        using (Bitmap img = LerImagem(it.Caminho))
-        using (Bitmap plano = new Bitmap(img.Width, img.Height, PixelFormat.Format24bppRgb))
+    // Copia da imagem sobre fundo branco, para quem nao entende transparencia
+    public static Bitmap SemTransparencia(Image img)
+    {
+        Bitmap plano = new Bitmap(img.Width, img.Height, PixelFormat.Format24bppRgb);
+        using (Graphics g = Graphics.FromImage(plano))
         {
-            using (Graphics g = Graphics.FromImage(plano))
-            {
-                g.Clear(Color.White);
-                g.DrawImage(img, 0, 0, img.Width, img.Height);
-            }
+            g.Clear(Color.White);
+            g.DrawImage(img, 0, 0, img.Width, img.Height);
+        }
+        return plano;
+    }
+
+    public static void Gravar(Image img, string destino)
+    {
+        string ext = Path.GetExtension(destino).ToLowerInvariant();
+        if (ext == ".png") { img.Save(destino, ImageFormat.Png); return; }
+
+        using (Bitmap plano = SemTransparencia(img))
+        {
             if (ext == ".bmp") { plano.Save(destino, ImageFormat.Bmp); return; }
 
             foreach (ImageCodecInfo c in ImageCodecInfo.GetImageEncoders())
@@ -1931,7 +1944,7 @@ class Janela : Form
     Label vazioHist, infoHist;
     TextBox previaTexto;
     PictureBox previaImagem;
-    Label botaoSalvarImagem;
+    Label botaoSalvarImagem, botaoEditarImagem;
     readonly List<Item> visHist = new List<Item>();
     bool confirmarLimpar;
 
@@ -2211,7 +2224,7 @@ class Janela : Form
         {
             case PgHistorico:
                 rodape.Text = "Clique  ver" + Tema.Ponto + "Duplo clique ou Enter  " + AcaoDeUsar() + Tema.Ponto +
-                              "Bot\u00e3o direito  mais op\u00e7\u00f5es" + Tema.Ponto + "Ctrl+S  salvar imagem" +
+                              "Bot\u00e3o direito  mais op\u00e7\u00f5es" + Tema.Ponto + "Ctrl+E  editar imagem" +
                               Tema.Ponto + "Shift+Del  apagar" + Tema.Ponto + "Esc  fechar";
                 break;
             case PgSalvos:
@@ -2326,12 +2339,30 @@ class Janela : Form
         dicas.SetToolTip(botaoSalvarImagem, "Salvar esta imagem como arquivo no computador (Ctrl+S)");
         infoHist.Controls.Add(botaoSalvarImagem);
 
+        botaoEditarImagem = BotaoCheio("Editar", Tema.Destaque, Color.FromArgb(156, 116, 250));
+        botaoEditarImagem.Font = Tema.Pequena;
+        botaoEditarImagem.Dock = DockStyle.Right;
+        botaoEditarImagem.Width = 76;
+        botaoEditarImagem.Visible = false;
+        botaoEditarImagem.MouseClick += delegate(object s, MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Left) EditarImagem();
+        };
+        dicas.SetToolTip(botaoEditarImagem, "Abrir em tela cheia para rabiscar, borrar, apagar ou colocar outra imagem por cima (Ctrl+E)");
+        infoHist.Controls.Add(botaoEditarImagem);
+
         previaTexto = NovoTextoPrevia();
         previaImagem = new PictureBox();
         previaImagem.Dock = DockStyle.Fill;
         previaImagem.SizeMode = PictureBoxSizeMode.Zoom;
         previaImagem.BackColor = Tema.Painel;
         previaImagem.Visible = false;
+        previaImagem.Cursor = Cursors.Hand;
+        previaImagem.MouseDoubleClick += delegate(object s, MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Left) EditarImagem();
+        };
+        dicas.SetToolTip(previaImagem, "Dois cliques para editar em tela cheia");
         direita.Controls.AddRange(new Control[] { previaTexto, previaImagem, infoHist });
 
         pg.Controls.AddRange(new Control[] { direita, espaco, esquerda });
@@ -2344,8 +2375,10 @@ class Janela : Form
         ToolStripMenuItem copiar = new ToolStripMenuItem("Copiar");
         ToolStripMenuItem salvar = new ToolStripMenuItem("Salvar na aba Salvos");
         ToolStripMenuItem salvarArquivo = new ToolStripMenuItem("Salvar imagem como...");
+        ToolStripMenuItem editar = new ToolStripMenuItem("Editar imagem");
         ToolStripMenuItem apagar = new ToolStripMenuItem("Apagar");
         salvarArquivo.Click += delegate { SalvarImagemComo(); };
+        editar.Click += delegate { EditarImagem(); };
         copiar.Click += delegate { Item it = ItemHistAtual(); if (it != null) Escolher(it); };
         salvar.Click += delegate
         {
@@ -2355,15 +2388,33 @@ class Janela : Form
             infoHist.Text = "\u2713  Salvo na aba Salvos";
         };
         apagar.Click += delegate { ApagarHistorico(); };
-        m.Items.AddRange(new ToolStripItem[] { copiar, salvar, salvarArquivo, new ToolStripSeparator(), apagar });
+        m.Items.AddRange(new ToolStripItem[] { copiar, editar, salvar, salvarArquivo, new ToolStripSeparator(), apagar });
         m.Opening += delegate(object s, System.ComponentModel.CancelEventArgs e)
         {
             Item it = ItemHistAtual();
             if (it == null) { e.Cancel = true; return; }
             salvar.Visible = !it.Imagem;
             salvarArquivo.Visible = it.Imagem;
+            editar.Visible = it.Imagem;
         };
         return m;
+    }
+
+    // A imagem e lida antes de fechar: se o arquivo sumiu, o aviso ainda aparece
+    void EditarImagem()
+    {
+        Item it = ItemHistAtual();
+        if (it == null || !it.Imagem) return;
+        Bitmap img;
+        try { img = Historico.LerImagem(it.Caminho); }
+        catch (Exception ex)
+        {
+            App.Log("Erro ao abrir no editor: " + ex.Message);
+            infoHist.Text = "N\u00e3o consegui abrir esta imagem.";
+            return;
+        }
+        Fechar();
+        App.Editar(img);
     }
 
     // Abre "Salvar como" para a imagem selecionada no historico
@@ -2442,7 +2493,7 @@ class Janela : Form
         if (velha != null) velha.Dispose();
 
         Item it = ItemHistAtual();
-        botaoSalvarImagem.Visible = it != null && it.Imagem;
+        botaoSalvarImagem.Visible = botaoEditarImagem.Visible = it != null && it.Imagem;
         if (it == null)
         {
             infoHist.Text = "";
@@ -3017,6 +3068,9 @@ class Janela : Form
                 case Keys.Control | Keys.S:
                     if (pagina == PgHistorico) SalvarImagemComo();
                     return true;
+                case Keys.Control | Keys.E:
+                    if (pagina == PgHistorico) EditarImagem();
+                    return true;
                 case Keys.Enter:
                     if (pagina == PgHistorico) { Item it = ItemHistAtual(); if (it != null) Escolher(it); }
                     else { Salvo s = SalvoAtual(); if (s != null) Escolher(s.Texto); }
@@ -3113,6 +3167,1398 @@ class Janela : Form
             if (statusIcone != null && statusIcone.Image != null) { statusIcone.Image.Dispose(); statusIcone.Image = null; }
             EmojiCor.Liberar();
             Emotes.Liberar();
+        }
+        base.Dispose(disposing);
+    }
+}
+
+// ---------------------------------------------------------------------
+// 8b. EDITOR DE IMAGEM: abre em tela cheia a partir do historico
+// ---------------------------------------------------------------------
+enum Ferramenta { Mover, Lapis, Marca, Borracha, Borrar, BorrarArea, Seta, Retangulo, Texto, Recortar }
+
+// Os pixels e o desfazer, sem nada de tela: da para testar sem abrir janela.
+// Tudo e desenhado direto na imagem, entao o que foi borrado ou apagado deixa
+// de existir no arquivo final, em vez de ficar escondido embaixo de uma camada.
+class Quadro : IDisposable
+{
+    const long LimiteDesfazer = 256L * 1024 * 1024;   // processo de 32 bits: nao passa disso
+    const int  LimitePassos   = 60;
+
+    // Um passo guarda so a area que mudou. Desfazer e refazer trocam os
+    // pixels guardados pelos que estao na imagem.
+    class Passo
+    {
+        public Rectangle Area;
+        public Bitmap    Pixels;
+        public bool      Inteiro;   // recorte: guarda a imagem toda
+        public int       Versao;
+        public long Bytes { get { return (long)Pixels.Width * Pixels.Height * 4; } }
+    }
+
+    public Bitmap Imagem;
+    Bitmap antes;       // ultimo estado confirmado
+    Bitmap borrada;     // copia borrada da imagem, feita so quando alguem borra
+    readonly List<Passo> desfazer = new List<Passo>();
+    readonly List<Passo> refazer  = new List<Passo>();
+    int versao, versaoSalva, contador;
+
+    // Traco em andamento
+    Ferramenta tipo;
+    bool emTraco;
+    Pen caneta;
+    TextureBrush textura;
+    PointF inicio, ultimo;
+    readonly List<PointF> pontos = new List<PointF>();
+    Rectangle tocado, desenhado;   // tudo o que o traco mexeu / o ultimo redesenho
+
+    public Quadro(Image origem)
+    {
+        Imagem = NovaCopia(origem);
+        antes  = NovaCopia(Imagem);
+    }
+
+    public int  Largura     { get { return Imagem.Width; } }
+    public int  Altura      { get { return Imagem.Height; } }
+    public bool Alterado    { get { return versao != versaoSalva; } }
+    public bool PodeDesfazer { get { return desfazer.Count > 0; } }
+    public bool PodeRefazer  { get { return refazer.Count > 0; } }
+    public void MarcarSalvo() { versaoSalva = versao; }
+    Rectangle Limites { get { return new Rectangle(0, 0, Imagem.Width, Imagem.Height); } }
+
+    static Bitmap NovaCopia(Image img)
+    {
+        Bitmap b = new Bitmap(img.Width, img.Height, PixelFormat.Format32bppPArgb);
+        using (Graphics g = Graphics.FromImage(b))
+        {
+            g.CompositingMode = CompositingMode.SourceCopy;
+            g.DrawImage(img, new Rectangle(0, 0, img.Width, img.Height));
+        }
+        return b;
+    }
+
+    static Bitmap Recorte(Bitmap de, Rectangle r)
+    {
+        Bitmap b = new Bitmap(r.Width, r.Height, PixelFormat.Format32bppPArgb);
+        using (Graphics g = Graphics.FromImage(b))
+        {
+            g.CompositingMode = CompositingMode.SourceCopy;
+            g.DrawImage(de, new Rectangle(0, 0, r.Width, r.Height), r, GraphicsUnit.Pixel);
+        }
+        return b;
+    }
+
+    static void Colar(Bitmap em, Bitmap pixels, Rectangle r)
+    {
+        using (Graphics g = Graphics.FromImage(em))
+        {
+            g.CompositingMode = CompositingMode.SourceCopy;
+            g.DrawImage(pixels, r, new Rectangle(0, 0, r.Width, r.Height), GraphicsUnit.Pixel);
+        }
+    }
+
+    static void CopiarArea(Bitmap de, Bitmap em, Rectangle r)
+    {
+        using (Graphics g = Graphics.FromImage(em))
+        {
+            g.CompositingMode = CompositingMode.SourceCopy;
+            g.DrawImage(de, r, r, GraphicsUnit.Pixel);
+        }
+    }
+
+    Graphics Pintor()
+    {
+        Graphics g = Graphics.FromImage(Imagem);
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+        return g;
+    }
+
+    // ---- Tracos ----
+    public void ComecarTraco(Ferramenta f, Color cor, int espessura, PointF p)
+    {
+        if (emTraco) CancelarTraco();
+        tipo    = f;
+        inicio  = ultimo = p;
+        tocado  = desenhado = Rectangle.Empty;
+        emTraco = true;
+        pontos.Clear();
+        pontos.Add(p);
+
+        if (f == Ferramenta.Borrar || f == Ferramenta.BorrarArea) textura = new TextureBrush(Borrada());
+
+        int largura = f == Ferramenta.Marca ? Math.Max(10, espessura * 3) : espessura;
+        if (f == Ferramenta.Marca) cor = Color.FromArgb(105, cor);
+        if (f == Ferramenta.Borracha) cor = Color.Transparent;
+        caneta = f == Ferramenta.Borrar ? new Pen(textura, largura) : new Pen(cor, largura);
+        caneta.StartCap = caneta.EndCap = LineCap.Round;
+        caneta.LineJoin = LineJoin.Round;
+
+        if (f == Ferramenta.Seta)
+        {
+            caneta.StartCap = LineCap.Round;
+            using (AdjustableArrowCap ponta = new AdjustableArrowCap(3.5f, 4.5f, true)) caneta.CustomEndCap = ponta;
+        }
+
+        if (f == Ferramenta.Lapis || f == Ferramenta.Borracha || f == Ferramenta.Borrar) Ponto(p);
+        else MoverTraco(p);
+    }
+
+    public Rectangle MoverTraco(PointF p)
+    {
+        if (!emTraco) return Rectangle.Empty;
+        Rectangle area;
+        if (tipo == Ferramenta.Lapis || tipo == Ferramenta.Borracha || tipo == Ferramenta.Borrar)
+        {
+            using (Graphics g = Pintor())
+            {
+                Preparar(g);
+                g.DrawLine(caneta, ultimo, p);
+            }
+            area = Caixa(ultimo, p, caneta.Width);
+            Marcar(area);
+        }
+        else
+        {
+            pontos.Add(p);
+            area = Redesenhar(p);
+        }
+        ultimo = p;
+        return area;
+    }
+
+    // Marca-texto e formas sao refeitos do zero a cada movimento: o marca-texto
+    // e transparente e escureceria onde o traco passa por cima dele mesmo.
+    Rectangle Redesenhar(PointF p)
+    {
+        Rectangle anterior = desenhado;
+        if (!anterior.IsEmpty) CopiarArea(antes, Imagem, anterior);
+
+        float folga = caneta.Width;
+        if (tipo == Ferramenta.Seta) folga = caneta.Width * 6;
+        Rectangle nova;
+        using (Graphics g = Pintor())
+        {
+            switch (tipo)
+            {
+                case Ferramenta.Marca:
+                    if (pontos.Count > 1) g.DrawLines(caneta, pontos.ToArray());
+                    nova = CaixaDe(pontos, folga);
+                    break;
+                case Ferramenta.Seta:
+                    if (Distancia(inicio, p) >= 2) g.DrawLine(caneta, inicio, p);
+                    nova = Caixa(inicio, p, folga);
+                    break;
+                case Ferramenta.Retangulo:
+                    RectangleF r = Retangulo(inicio, p);
+                    if (r.Width >= 1 && r.Height >= 1) g.DrawRectangle(caneta, r.X, r.Y, r.Width, r.Height);
+                    nova = Caixa(inicio, p, folga);
+                    break;
+                default:   // BorrarArea
+                    g.FillRectangle(textura, Retangulo(inicio, p));
+                    nova = Caixa(inicio, p, 2);
+                    break;
+            }
+        }
+        desenhado = Rectangle.Intersect(nova, Limites);
+        Marcar(desenhado);
+        return anterior.IsEmpty ? desenhado : Rectangle.Union(anterior, desenhado);
+    }
+
+    // A borracha troca os pixels em vez de somar: deixa a area transparente
+    void Preparar(Graphics g)
+    {
+        if (tipo != Ferramenta.Borracha) return;
+        g.SmoothingMode = SmoothingMode.None;
+        g.CompositingMode = CompositingMode.SourceCopy;
+    }
+
+    // Um clique sem arrastar tambem marca
+    void Ponto(PointF p)
+    {
+        float d = caneta.Width;
+        using (Graphics g = Pintor())
+        {
+            Preparar(g);
+            using (Brush b = tipo == Ferramenta.Borrar ? (Brush)textura.Clone() : new SolidBrush(caneta.Color))
+                g.FillEllipse(b, p.X - d / 2, p.Y - d / 2, d, d);
+        }
+        Marcar(Caixa(p, p, d));
+    }
+
+    void Marcar(Rectangle r)
+    {
+        r = Rectangle.Intersect(r, Limites);
+        if (r.Width <= 0 || r.Height <= 0) return;
+        tocado = tocado.IsEmpty ? r : Rectangle.Union(tocado, r);
+    }
+
+    public void TerminarTraco()
+    {
+        if (!emTraco) return;
+        Rectangle area = tocado;
+        bool vazio = tipo != Ferramenta.Lapis && tipo != Ferramenta.Borracha && tipo != Ferramenta.Borrar &&
+                     tipo != Ferramenta.Marca && Distancia(inicio, ultimo) < 2;
+        FecharTraco();
+        if (vazio) { if (!area.IsEmpty) CopiarArea(antes, Imagem, area); return; }
+        Confirmar(area);
+    }
+
+    public void CancelarTraco()
+    {
+        if (!emTraco) return;
+        Rectangle area = tocado;
+        FecharTraco();
+        if (!area.IsEmpty) CopiarArea(antes, Imagem, area);
+    }
+
+    void FecharTraco()
+    {
+        emTraco = false;
+        if (caneta != null)  { caneta.Dispose(); caneta = null; }
+        if (textura != null) { textura.Dispose(); textura = null; }
+        pontos.Clear();
+    }
+
+    static float Distancia(PointF a, PointF b)
+    {
+        float x = a.X - b.X, y = a.Y - b.Y;
+        return (float)Math.Sqrt(x * x + y * y);
+    }
+
+    public static RectangleF Retangulo(PointF a, PointF b)
+    {
+        return RectangleF.FromLTRB(Math.Min(a.X, b.X), Math.Min(a.Y, b.Y), Math.Max(a.X, b.X), Math.Max(a.Y, b.Y));
+    }
+
+    static Rectangle Caixa(PointF a, PointF b, float folga)
+    {
+        RectangleF r = Retangulo(a, b);
+        r.Inflate(folga / 2 + 2, folga / 2 + 2);
+        return Rectangle.FromLTRB((int)Math.Floor(r.Left), (int)Math.Floor(r.Top), (int)Math.Ceiling(r.Right), (int)Math.Ceiling(r.Bottom));
+    }
+
+    static Rectangle CaixaDe(List<PointF> ps, float folga)
+    {
+        Rectangle r = Caixa(ps[0], ps[0], folga);
+        foreach (PointF p in ps) r = Rectangle.Union(r, Caixa(p, p, folga));
+        return r;
+    }
+
+    // Reduz bastante e amplia de volta. O tamanho do bloco cresce com a imagem
+    // para um print 4K ficar tao ilegivel quanto um Full HD.
+    Bitmap Borrada()
+    {
+        if (borrada != null) return borrada;
+        int w = Imagem.Width, h = Imagem.Height;
+        int passo = Math.Max(10, Math.Max(w, h) / 150);
+        int pw = Math.Max(1, w / passo), ph = Math.Max(1, h / passo);
+
+        using (ImageAttributes borda = new ImageAttributes())
+        using (Bitmap pequena = new Bitmap(pw, ph, PixelFormat.Format32bppPArgb))
+        {
+            borda.SetWrapMode(WrapMode.TileFlipXY);   // sem isso as beiradas escurecem
+            using (Graphics g = Graphics.FromImage(pequena))
+            {
+                g.InterpolationMode = InterpolationMode.HighQualityBilinear;
+                g.PixelOffsetMode   = PixelOffsetMode.HighQuality;
+                g.DrawImage(Imagem, new Rectangle(0, 0, pw, ph), 0, 0, w, h, GraphicsUnit.Pixel, borda);
+            }
+            Bitmap b = new Bitmap(w, h, PixelFormat.Format32bppPArgb);
+            using (Graphics g = Graphics.FromImage(b))
+            {
+                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                g.PixelOffsetMode   = PixelOffsetMode.HighQuality;
+                g.DrawImage(pequena, new Rectangle(0, 0, w, h), 0, 0, pw, ph, GraphicsUnit.Pixel, borda);
+            }
+            borrada = b;
+        }
+        return borrada;
+    }
+
+    void SoltarBorrada()
+    {
+        if (borrada != null) { borrada.Dispose(); borrada = null; }
+    }
+
+    // ---- Texto, imagem por cima e recorte ----
+    public void Escrever(string texto, Font fonte, Color cor, PointF onde)
+    {
+        if (string.IsNullOrEmpty(texto)) return;
+        using (Graphics g = Pintor())
+        {
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+            SizeF t = g.MeasureString(texto, fonte);
+            g.DrawString(texto, fonte, Tema.Pincel(cor), onde);
+            Confirmar(Caixa(onde, new PointF(onde.X + t.Width, onde.Y + t.Height), 4));
+        }
+    }
+
+    public void Estampar(Image img, RectangleF onde)
+    {
+        using (Graphics g = Pintor())
+        {
+            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+            g.DrawImage(img, onde);
+        }
+        Confirmar(Caixa(onde.Location, new PointF(onde.Right, onde.Bottom), 2));
+    }
+
+    public bool Recortar(Rectangle r)
+    {
+        r = Rectangle.Intersect(r, Limites);
+        if (r.Width < 2 || r.Height < 2) return false;
+
+        Passo p = new Passo();
+        p.Inteiro = true;
+        p.Pixels  = Imagem;
+        p.Versao  = versao;
+        Imagem = Recorte(p.Pixels, r);
+        antes.Dispose();
+        antes = NovaCopia(Imagem);
+        Registrar(p);
+        return true;
+    }
+
+    // ---- Desfazer ----
+    void Confirmar(Rectangle area)
+    {
+        area = Rectangle.Intersect(area, Limites);
+        if (area.Width <= 0 || area.Height <= 0) return;
+
+        Passo p = new Passo();
+        p.Area   = area;
+        p.Pixels = Recorte(antes, area);
+        p.Versao = versao;
+        CopiarArea(Imagem, antes, area);
+        Registrar(p);
+    }
+
+    void Registrar(Passo p)
+    {
+        desfazer.Add(p);
+        Soltar(refazer);
+        versao = ++contador;
+        SoltarBorrada();
+
+        long total = 0;
+        foreach (Passo d in desfazer) total += d.Bytes;
+        while (desfazer.Count > 1 && (desfazer.Count > LimitePassos || total > LimiteDesfazer))
+        {
+            total -= desfazer[0].Bytes;
+            desfazer[0].Pixels.Dispose();
+            desfazer.RemoveAt(0);
+        }
+    }
+
+    static void Soltar(List<Passo> lista)
+    {
+        foreach (Passo p in lista) p.Pixels.Dispose();
+        lista.Clear();
+    }
+
+    public bool Desfazer() { return Trocar(desfazer, refazer); }
+    public bool Refazer()  { return Trocar(refazer, desfazer); }
+
+    bool Trocar(List<Passo> de, List<Passo> para)
+    {
+        if (de.Count == 0) return false;
+        Passo p = de[de.Count - 1];
+        de.RemoveAt(de.Count - 1);
+
+        if (p.Inteiro)
+        {
+            Bitmap atual = Imagem;
+            Imagem   = p.Pixels;
+            p.Pixels = atual;
+            antes.Dispose();
+            antes = NovaCopia(Imagem);
+        }
+        else
+        {
+            Bitmap atual = Recorte(Imagem, p.Area);
+            Colar(Imagem, p.Pixels, p.Area);
+            Colar(antes, p.Pixels, p.Area);
+            p.Pixels.Dispose();
+            p.Pixels = atual;
+        }
+
+        int v = versao;
+        versao   = p.Versao;
+        p.Versao = v;
+        para.Add(p);
+        SoltarBorrada();
+        return true;
+    }
+
+    public void Dispose()
+    {
+        FecharTraco();
+        Soltar(desfazer);
+        Soltar(refazer);
+        SoltarBorrada();
+        if (antes != null)  { antes.Dispose(); antes = null; }
+        if (Imagem != null) { Imagem.Dispose(); Imagem = null; }
+    }
+}
+
+// Superficie de desenho, sem piscar
+class TelaEditor : Control
+{
+    public TelaEditor()
+    {
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+                 ControlStyles.OptimizedDoubleBuffer | ControlStyles.Opaque | ControlStyles.Selectable, true);
+        BackColor = Color.FromArgb(14, 14, 18);
+    }
+
+    // Setas e Tab ficam para o editor, em vez de trocar de controle
+    protected override bool IsInputKey(Keys k) { return true; }
+}
+
+class EditorImagem : Form
+{
+    static readonly Color[] Cores =
+    {
+        Color.FromArgb(239, 68, 68), Color.FromArgb(250, 204, 21), Color.FromArgb(34, 197, 94),
+        Color.FromArgb(59, 130, 246), Color.FromArgb(139, 92, 246), Color.FromArgb(236, 72, 153),
+        Color.White, Color.Black
+    };
+    static readonly int[] Tamanhos = { 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96 };
+
+    // Ficam guardados entre uma edicao e outra
+    static Color cor = Cores[0];
+    static int indiceTamanho = 3;
+
+    readonly Quadro quadro;
+    readonly TelaEditor tela;
+    readonly ToolTip dicas = new ToolTip();
+    readonly Label rotuloTamanho, rotuloZoom, rotuloDica, rotuloAviso;
+    readonly Dictionary<Ferramenta, Label> botoes = new Dictionary<Ferramenta, Label>();
+    readonly List<Label> botoesCor = new List<Label>();
+    readonly Label botaoDesfazer, botaoRefazer, botaoImagem;
+    readonly TextureBrush xadrez;
+    readonly Icon icone;
+    readonly Timer apagaAviso = new Timer();
+
+    Ferramenta ferramenta = Ferramenta.Lapis;
+    bool saindo;
+
+    // Vista: ponto da imagem (x, y) aparece na tela em (x * zoom + ox, y * zoom + oy)
+    float zoom = 1, ox, oy;
+    bool ajustada = true;
+
+    // Mouse
+    bool desenhando, recortando, arrastando, espaco;
+    Point arrasteMouse;
+    PointF arrasteVista;
+    PointF cantoRecorte, fimRecorte;
+    Point mouse = new Point(-100, -100);
+
+    // Imagem colada, ainda solta: da para mover e redimensionar
+    Bitmap flutuante;
+    RectangleF posFlutuante, posInicial;
+    int alca = -1;
+    PointF inicioFlutuante;
+    bool movendoFlutuante;
+
+    // Texto sendo digitado
+    TextBox caixaTexto;
+    PointF posTexto;
+
+    public EditorImagem(Bitmap imagem)
+    {
+        quadro = new Quadro(imagem);
+        imagem.Dispose();
+
+        icone = Tema.CriarIcone();
+        Icon = icone;
+        Text = "Editor de imagem";
+        FormBorderStyle = FormBorderStyle.None;
+        StartPosition   = FormStartPosition.Manual;
+        BackColor       = Tema.Fundo;
+        KeyPreview      = true;
+        Bounds          = Screen.FromPoint(Cursor.Position).Bounds;
+
+        using (Bitmap b = new Bitmap(16, 16))
+        {
+            using (Graphics g = Graphics.FromImage(b))
+            {
+                g.Clear(Color.FromArgb(58, 58, 66));
+                g.FillRectangle(Tema.Pincel(Color.FromArgb(44, 44, 50)), 0, 0, 8, 8);
+                g.FillRectangle(Tema.Pincel(Color.FromArgb(44, 44, 50)), 8, 8, 8, 8);
+            }
+            xadrez = new TextureBrush(b);
+        }
+
+        tela = new TelaEditor();
+        tela.Dock = DockStyle.Fill;
+        tela.Paint      += Pintar;
+        tela.MouseDown  += MouseApertou;
+        tela.MouseMove  += MouseMoveu;
+        tela.MouseUp    += MouseSoltou;
+        tela.MouseWheel += Roda;
+        tela.MouseLeave += delegate { Point velho = mouse; mouse = new Point(-100, -100); InvalidarPincel(velho); };
+        tela.Resize     += delegate { if (ajustada) Ajustar(); };
+
+        // ---- Primeira linha: ferramentas e acoes ----
+        Panel linha1 = new Panel();
+        linha1.Dock = DockStyle.Top;
+        linha1.Height = 46;
+        linha1.Width = Width;   // os botoes ancorados a direita medem a partir daqui
+        linha1.BackColor = Tema.Fundo;
+
+        int x = 10;
+        x = BotaoFerramenta(linha1, Ferramenta.Mover,      "Mover",       "Mover a vis\u00e3o (V). Segure Espa\u00e7o em qualquer ferramenta", 62, x);
+        x = BotaoFerramenta(linha1, Ferramenta.Lapis,      "L\u00e1pis",  "Rabiscar (L)", 58, x);
+        x = BotaoFerramenta(linha1, Ferramenta.Marca,      "Marca-texto", "Grifar por cima (M)", 92, x);
+        x = BotaoFerramenta(linha1, Ferramenta.Borracha,   "Borracha",    "Apagar parte da imagem (E)", 76, x);
+        x = BotaoFerramenta(linha1, Ferramenta.Borrar,     "Borrar",      "Passar o pincel para borrar (B)", 62, x);
+        x = BotaoFerramenta(linha1, Ferramenta.BorrarArea, "Borrar \u00e1rea", "Arrastar um ret\u00e2ngulo para borrar (A)", 92, x);
+        x = BotaoFerramenta(linha1, Ferramenta.Seta,       "Seta",        "Desenhar seta (S)", 52, x);
+        x = BotaoFerramenta(linha1, Ferramenta.Retangulo,  "Ret\u00e2ngulo", "Desenhar ret\u00e2ngulo (R)", 82, x);
+        x = BotaoFerramenta(linha1, Ferramenta.Texto,      "Texto",       "Escrever na imagem (T)", 56, x);
+        x = BotaoFerramenta(linha1, Ferramenta.Recortar,   "Recortar",    "Arrastar para recortar (C)", 72, x);
+
+        botaoImagem = Botao("Imagem por cima", 124, "Colocar outra imagem por cima (I). Ctrl+V cola da \u00e1rea de transfer\u00eancia");
+        botaoImagem.Location = new Point(x + 8, 7);
+        botaoImagem.MouseClick += delegate(object s, MouseEventArgs e) { if (e.Button == MouseButtons.Left) MenuImagem(); };
+        linha1.Controls.Add(botaoImagem);
+
+        Label fechar = BotaoDireita(linha1, "Fechar", 66, "Fechar o editor (Esc)");
+        fechar.MouseClick += delegate(object s, MouseEventArgs e) { if (e.Button == MouseButtons.Left) Close(); };
+
+        Label salvar = BotaoDireita(linha1, "Salvar como...", 104, "Salvar em arquivo (Ctrl+S)");
+        salvar.MouseClick += delegate(object s, MouseEventArgs e) { if (e.Button == MouseButtons.Left) SalvarComo(); };
+
+        Label copiar = BotaoDireita(linha1, "Copiar", 72, "Copiar o resultado e guardar no hist\u00f3rico (Ctrl+C)");
+        copiar.BackColor = Tema.Destaque;
+        copiar.MouseClick += delegate(object s, MouseEventArgs e) { if (e.Button == MouseButtons.Left) Copiar(); };
+
+        // ---- Segunda linha: cor, tamanho e avisos ----
+        Panel linha2 = new Panel();
+        linha2.Dock = DockStyle.Top;
+        linha2.Height = 38;
+        linha2.Width = Width;
+        linha2.BackColor = Tema.Painel;
+
+        x = 12;
+        foreach (Color c in Cores)
+        {
+            Label l = new Label();
+            l.Location = new Point(x, 8);
+            l.Size = new Size(22, 22);
+            l.BackColor = c;
+            l.Cursor = Cursors.Hand;
+            Color esta = c;
+            l.MouseDown += delegate { EscolherCor(esta); };
+            l.Paint += delegate(object s, PaintEventArgs e)
+            {
+                if (l.BackColor.ToArgb() != cor.ToArgb()) return;
+                Color contraste = l.BackColor.GetBrightness() > 0.5f ? Color.Black : Color.White;
+                using (Pen p = new Pen(contraste, 2)) e.Graphics.DrawRectangle(p, 2, 2, 17, 17);
+            };
+            botoesCor.Add(l);
+            linha2.Controls.Add(l);
+            x += 26;
+        }
+
+        Label outra = Botao("Outra...", 62, "Escolher outra cor");
+        outra.Location = new Point(x + 4, 5);
+        outra.Height = 28;
+        outra.Font = Tema.Pequena;
+        outra.MouseClick += delegate(object s, MouseEventArgs e) { if (e.Button == MouseButtons.Left) OutraCor(); };
+        linha2.Controls.Add(outra);
+        x += 80;
+
+        Label menos = Botao("\u2212", 28, "Tra\u00e7o mais fino ([)");
+        menos.Location = new Point(x, 5);
+        menos.Height = 28;
+        menos.MouseDown += delegate { MudarTamanho(-1); };
+        rotuloTamanho = NovoRotulo("", Tema.Normal, Tema.Texto, HorizontalAlignment.Center);
+        rotuloTamanho.Location = new Point(x + 28, 5);
+        rotuloTamanho.Size = new Size(58, 28);
+        Label mais = Botao("+", 28, "Tra\u00e7o mais grosso (])");
+        mais.Location = new Point(x + 86, 5);
+        mais.Height = 28;
+        mais.MouseDown += delegate { MudarTamanho(1); };
+        linha2.Controls.AddRange(new Control[] { menos, rotuloTamanho, mais });
+        x += 128;
+
+        botaoDesfazer = Botao("Desfazer", 74, "Desfazer (Ctrl+Z)");
+        botaoDesfazer.Location = new Point(x, 5);
+        botaoDesfazer.Height = 28;
+        botaoDesfazer.Font = Tema.Pequena;
+        botaoDesfazer.MouseClick += delegate(object s, MouseEventArgs e) { if (e.Button == MouseButtons.Left) Desfazer(); };
+        botaoRefazer = Botao("Refazer", 68, "Refazer (Ctrl+Y)");
+        botaoRefazer.Location = new Point(x + 78, 5);
+        botaoRefazer.Height = 28;
+        botaoRefazer.Font = Tema.Pequena;
+        botaoRefazer.MouseClick += delegate(object s, MouseEventArgs e) { if (e.Button == MouseButtons.Left) Refazer(); };
+        linha2.Controls.AddRange(new Control[] { botaoDesfazer, botaoRefazer });
+        x += 158;
+
+        rotuloZoom = NovoRotulo("", Tema.Pequena, Tema.Suave, HorizontalAlignment.Right);
+        rotuloZoom.Dock = DockStyle.Right;
+        rotuloZoom.Width = 170;
+        rotuloZoom.Cursor = Cursors.Hand;
+        rotuloZoom.MouseDown += delegate { Ajustar(); };
+        dicas.SetToolTip(rotuloZoom, "Clique para caber na tela (Ctrl+0)");
+
+        rotuloDica = NovoRotulo("", Tema.Pequena, Tema.Suave, HorizontalAlignment.Left);
+        rotuloDica.Location = new Point(x + 6, 5);
+        rotuloDica.Size = new Size(Math.Max(100, Width - x - 190), 28);
+        rotuloDica.Anchor = AnchorStyles.Left | AnchorStyles.Top | AnchorStyles.Right;
+
+        rotuloAviso = rotuloDica;
+        linha2.Controls.Add(rotuloDica);
+        linha2.Controls.Add(rotuloZoom);
+
+        Controls.Add(tela);
+        Controls.Add(linha2);
+        Controls.Add(linha1);
+
+        apagaAviso.Interval = 4000;
+        apagaAviso.Tick += delegate { apagaAviso.Stop(); MostrarDica(); };
+
+        AtualizarTamanho();
+        TrocarFerramenta(Ferramenta.Lapis);
+        AtualizarBotoes();
+    }
+
+    // ---- Montagem dos controles ----
+    static Label NovoRotulo(string texto, Font fonte, Color corTexto, HorizontalAlignment lado)
+    {
+        Label l = new Label();
+        l.Text = texto;
+        l.Font = fonte;
+        l.ForeColor = corTexto;
+        l.BackColor = Color.Transparent;
+        l.UseMnemonic = false;
+        l.TextAlign = lado == HorizontalAlignment.Center ? ContentAlignment.MiddleCenter :
+                      lado == HorizontalAlignment.Right ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft;
+        return l;
+    }
+
+    Label Botao(string texto, int largura, string dica)
+    {
+        Label l = NovoRotulo(texto, Tema.Normal, Tema.Texto, HorizontalAlignment.Center);
+        l.Size = new Size(largura, 32);
+        l.BackColor = Tema.Campo;
+        l.Cursor = Cursors.Hand;
+        l.MouseEnter += delegate { if (l.BackColor == Tema.Campo) l.BackColor = Tema.CampoSob; };
+        l.MouseLeave += delegate { if (l.BackColor == Tema.CampoSob) l.BackColor = Tema.Campo; };
+        dicas.SetToolTip(l, dica);
+        return l;
+    }
+
+    int BotaoFerramenta(Panel p, Ferramenta f, string texto, string dica, int largura, int x)
+    {
+        Label l = Botao(texto, largura, dica);
+        l.Location = new Point(x, 7);
+        l.MouseDown += delegate(object s, MouseEventArgs e) { if (e.Button == MouseButtons.Left) TrocarFerramenta(f); };
+        botoes[f] = l;
+        p.Controls.Add(l);
+        return x + largura + 4;
+    }
+
+    Label BotaoDireita(Panel p, string texto, int largura, string dica)
+    {
+        Label l = Botao(texto, largura, dica);
+        int direita = p.Tag == null ? Width - 10 : (int)p.Tag;
+        l.Location = new Point(direita - largura, 7);
+        l.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        p.Tag = direita - largura - 6;
+        p.Controls.Add(l);
+        return l;
+    }
+
+    // ---- Estado ----
+    bool UsaTamanho { get { return ferramenta == Ferramenta.Lapis || ferramenta == Ferramenta.Marca || ferramenta == Ferramenta.Borracha || ferramenta == Ferramenta.Borrar; } }
+
+    public void TrocarFerramenta(Ferramenta f)
+    {
+        Assentar();
+        ferramenta = f;
+        foreach (KeyValuePair<Ferramenta, Label> b in botoes)
+            b.Value.BackColor = b.Key == f ? Tema.Selecao : Tema.Campo;
+        Point velho = mouse;
+        InvalidarPincel(velho);
+        tela.Cursor = CursorDaFerramenta();
+        apagaAviso.Stop();
+        MostrarDica();
+    }
+
+    Cursor CursorDaFerramenta()
+    {
+        if (ferramenta == Ferramenta.Mover || espaco) return Cursors.Hand;
+        if (ferramenta == Ferramenta.Texto) return Cursors.IBeam;
+        return Cursors.Cross;
+    }
+
+    void MostrarDica()
+    {
+        string d;
+        switch (ferramenta)
+        {
+            case Ferramenta.Mover:      d = "Arraste para mover a imagem na tela. A roda do mouse aproxima."; break;
+            case Ferramenta.Lapis:      d = "Arraste para rabiscar."; break;
+            case Ferramenta.Marca:      d = "Arraste para grifar."; break;
+            case Ferramenta.Borracha:   d = "Arraste para apagar: o que sair fica transparente."; break;
+            case Ferramenta.Borrar:     d = "Arraste por cima do que quer esconder."; break;
+            case Ferramenta.BorrarArea: d = "Arraste um ret\u00e2ngulo por cima do que quer esconder."; break;
+            case Ferramenta.Seta:       d = "Arraste do come\u00e7o at\u00e9 a ponta da seta."; break;
+            case Ferramenta.Retangulo:  d = "Arraste de um canto ao outro."; break;
+            case Ferramenta.Texto:      d = "Clique onde quer escrever. Enter confirma, Shift+Enter pula linha."; break;
+            default:                    d = "Arraste sobre a parte que quer manter. Ctrl+Z volta atr\u00e1s."; break;
+        }
+        rotuloDica.ForeColor = Tema.Suave;
+        rotuloDica.Text = d;
+    }
+
+    void Avisar(string texto, bool erro)
+    {
+        rotuloAviso.ForeColor = erro ? Tema.Perigo : Tema.Sucesso;
+        rotuloAviso.Text = texto;
+        apagaAviso.Stop();
+        apagaAviso.Start();
+    }
+
+    void AtualizarBotoes()
+    {
+        botaoDesfazer.ForeColor = quadro.PodeDesfazer ? Tema.Texto : Tema.Suave;
+        botaoRefazer.ForeColor  = quadro.PodeRefazer  ? Tema.Texto : Tema.Suave;
+        rotuloZoom.Text = quadro.Largura + " x " + quadro.Altura + Tema.Ponto + (int)Math.Round(zoom * 100) + "%  ";
+    }
+
+    void EscolherCor(Color c)
+    {
+        cor = c;
+        foreach (Label l in botoesCor) l.Invalidate();
+        if (caixaTexto != null) caixaTexto.ForeColor = c;
+    }
+
+    void OutraCor()
+    {
+        using (ColorDialog d = new ColorDialog())
+        {
+            d.Color = cor;
+            d.FullOpen = true;
+            if (d.ShowDialog(this) == DialogResult.OK) EscolherCor(d.Color);
+        }
+    }
+
+    void MudarTamanho(int passo)
+    {
+        Point velho = mouse;
+        indiceTamanho = Math.Max(0, Math.Min(Tamanhos.Length - 1, indiceTamanho + passo));
+        AtualizarTamanho();
+        InvalidarPincel(velho);
+    }
+
+    void AtualizarTamanho() { rotuloTamanho.Text = Tamanhos[indiceTamanho] + " px"; }
+
+    // ---- Vista ----
+    RectangleF ImagemNaTela { get { return new RectangleF(ox, oy, quadro.Largura * zoom, quadro.Altura * zoom); } }
+
+    PointF NaImagem(Point p) { return new PointF((p.X - ox) / zoom, (p.Y - oy) / zoom); }
+
+    RectangleF NaTela(RectangleF r)
+    {
+        return new RectangleF(r.X * zoom + ox, r.Y * zoom + oy, r.Width * zoom, r.Height * zoom);
+    }
+
+    public void Ajustar()
+    {
+        if (tela.ClientSize.Width <= 0 || tela.ClientSize.Height <= 0) return;
+        const int margem = 16;
+        float z = Math.Min((tela.ClientSize.Width - margem * 2f) / quadro.Largura, (tela.ClientSize.Height - margem * 2f) / quadro.Altura);
+        zoom = Math.Max(0.02f, Math.Min(1f, z));   // imagem pequena fica no tamanho real, sem borrar
+        ox = (float)Math.Round((tela.ClientSize.Width - quadro.Largura * zoom) / 2);
+        oy = (float)Math.Round((tela.ClientSize.Height - quadro.Altura * zoom) / 2);
+        ajustada = true;
+        AtualizarBotoes();
+        tela.Invalidate();
+    }
+
+    void Roda(object s, MouseEventArgs e)
+    {
+        if (desenhando || recortando) return;
+        if ((ModifierKeys & Keys.Control) != 0) { MudarTamanho(e.Delta > 0 ? 1 : -1); return; }
+
+        Assentar();
+        float novo = Math.Max(0.05f, Math.Min(16f, zoom * (e.Delta > 0 ? 1.25f : 0.8f)));
+        // Quase 100%: encaixa, para os pixels nao ficarem interpolados
+        if (Math.Abs(novo - 1f) < 0.08f) novo = 1f;
+        PointF ponto = NaImagem(e.Location);
+        zoom = novo;
+        ox = (float)Math.Round(e.X - ponto.X * zoom);
+        oy = (float)Math.Round(e.Y - ponto.Y * zoom);
+        ajustada = false;
+        AtualizarBotoes();
+        tela.Invalidate();
+    }
+
+    void InvalidarImagem(Rectangle r)
+    {
+        if (r.IsEmpty) return;
+        RectangleF t = NaTela(r);
+        t.Inflate(3, 3);
+        tela.Invalidate(Rectangle.Ceiling(t));
+    }
+
+    void InvalidarPincel(Point p)
+    {
+        if (!UsaTamanho) return;
+        int r = (int)Math.Ceiling(RaioPincel() * zoom) + 4;
+        tela.Invalidate(new Rectangle(p.X - r, p.Y - r, r * 2, r * 2));
+    }
+
+    float RaioPincel()
+    {
+        int t = Tamanhos[indiceTamanho];
+        if (ferramenta == Ferramenta.Marca) t = Math.Max(10, t * 3);
+        return t / 2f;
+    }
+
+    // ---- Desenho na tela ----
+    void Pintar(object s, PaintEventArgs e)
+    {
+        Graphics g = e.Graphics;
+        g.Clear(tela.BackColor);
+
+        RectangleF area = ImagemNaTela;
+        RectangleF visivel = RectangleF.Intersect(area, e.ClipRectangle);
+        if (visivel.Width > 0 && visivel.Height > 0) g.FillRectangle(xadrez, visivel);
+
+        g.PixelOffsetMode = PixelOffsetMode.Half;
+        g.InterpolationMode = zoom >= 1 ? InterpolationMode.NearestNeighbor : InterpolationMode.HighQualityBilinear;
+        g.DrawImage(quadro.Imagem, area, new RectangleF(0, 0, quadro.Largura, quadro.Altura), GraphicsUnit.Pixel);
+        g.PixelOffsetMode = PixelOffsetMode.Default;
+
+        if (flutuante != null)
+        {
+            g.InterpolationMode = InterpolationMode.HighQualityBilinear;
+            g.PixelOffsetMode = PixelOffsetMode.Half;
+            RectangleF r = NaTela(posFlutuante);
+            g.DrawImage(flutuante, r);
+            g.PixelOffsetMode = PixelOffsetMode.Default;
+            using (Pen p = new Pen(Tema.Destaque, 2))
+            {
+                p.DashStyle = DashStyle.Dash;
+                g.DrawRectangle(p, r.X, r.Y, r.Width, r.Height);
+            }
+            foreach (RectangleF a in Alcas()) { g.FillRectangle(Brushes.White, a); g.DrawRectangle(Pens.Black, a.X, a.Y, a.Width, a.Height); }
+        }
+
+        if (recortando) PintarRecorte(g, area);
+
+        if (UsaTamanho && !espaco && flutuante == null && caixaTexto == null && mouse.X >= 0 && !arrastando)
+        {
+            float raio = RaioPincel() * zoom;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.DrawEllipse(Pens.Black, mouse.X - raio - 1, mouse.Y - raio - 1, raio * 2 + 2, raio * 2 + 2);
+            g.DrawEllipse(Pens.White, mouse.X - raio, mouse.Y - raio, raio * 2, raio * 2);
+            g.SmoothingMode = SmoothingMode.Default;
+        }
+    }
+
+    void PintarRecorte(Graphics g, RectangleF area)
+    {
+        RectangleF r = NaTela(Quadro.Retangulo(cantoRecorte, fimRecorte));
+        using (Region fora = new Region(area))
+        using (Brush escuro = new SolidBrush(Color.FromArgb(150, 0, 0, 0)))
+        using (Pen p = new Pen(Color.White, 1))
+        {
+            fora.Exclude(r);
+            g.FillRegion(escuro, fora);
+            p.DashStyle = DashStyle.Dash;
+            g.DrawRectangle(p, r.X, r.Y, r.Width, r.Height);
+        }
+    }
+
+    // ---- Mouse ----
+    void MouseApertou(object s, MouseEventArgs e)
+    {
+        tela.Focus();
+        bool mover = e.Button == MouseButtons.Middle || (e.Button == MouseButtons.Left && (espaco || ferramenta == Ferramenta.Mover));
+        if (mover && flutuante == null)
+        {
+            ComecarArraste(e.Location);
+            return;
+        }
+        if (e.Button != MouseButtons.Left) return;
+
+        if (flutuante != null) { ApertouFlutuante(e.Location); return; }
+
+        if (ferramenta == Ferramenta.Texto)
+        {
+            if (caixaTexto != null) Assentar();
+            else AbrirTexto(e.Location);
+            return;
+        }
+
+        if (ferramenta == Ferramenta.Recortar)
+        {
+            recortando = true;
+            cantoRecorte = fimRecorte = Limitado(NaImagem(e.Location));
+            return;
+        }
+
+        Assentar();
+        if (ferramenta == Ferramenta.Borrar || ferramenta == Ferramenta.BorrarArea) tela.Cursor = Cursors.WaitCursor;
+        quadro.ComecarTraco(ferramenta, cor, Tamanhos[indiceTamanho], NaImagem(e.Location));
+        tela.Cursor = CursorDaFerramenta();
+        desenhando = true;
+        tela.Invalidate();
+    }
+
+    void ComecarArraste(Point p)
+    {
+        arrastando = true;
+        arrasteMouse = p;
+        arrasteVista = new PointF(ox, oy);
+    }
+
+    void MouseMoveu(object s, MouseEventArgs e)
+    {
+        Point velho = mouse;
+        mouse = e.Location;
+
+        if (arrastando)
+        {
+            ox = arrasteVista.X + e.X - arrasteMouse.X;
+            oy = arrasteVista.Y + e.Y - arrasteMouse.Y;
+            ajustada = false;
+            tela.Invalidate();
+            return;
+        }
+
+        if (desenhando)
+        {
+            InvalidarImagem(quadro.MoverTraco(NaImagem(e.Location)));
+        }
+        else if (recortando)
+        {
+            fimRecorte = Limitado(NaImagem(e.Location));
+            tela.Invalidate();
+        }
+        else if (flutuante != null)
+        {
+            MoveuFlutuante(e.Location);
+        }
+
+        InvalidarPincel(velho);
+        InvalidarPincel(mouse);
+    }
+
+    void MouseSoltou(object s, MouseEventArgs e)
+    {
+        if (arrastando) { arrastando = false; tela.Invalidate(); return; }
+
+        if (desenhando)
+        {
+            desenhando = false;
+            quadro.TerminarTraco();
+            AtualizarBotoes();
+            tela.Invalidate();
+        }
+        else if (recortando)
+        {
+            recortando = false;
+            RectangleF r = Quadro.Retangulo(cantoRecorte, fimRecorte);
+            if (quadro.Recortar(Rectangle.Round(r))) Ajustar();
+            tela.Invalidate();
+            AtualizarBotoes();
+        }
+        alca = -1;
+        movendoFlutuante = false;
+    }
+
+    PointF Limitado(PointF p)
+    {
+        return new PointF(Math.Max(0, Math.Min(quadro.Largura, p.X)), Math.Max(0, Math.Min(quadro.Altura, p.Y)));
+    }
+
+    // ---- Imagem por cima ----
+    RectangleF[] Alcas()
+    {
+        RectangleF r = NaTela(posFlutuante);
+        const float t = 10;
+        return new[]
+        {
+            new RectangleF(r.Left - t / 2, r.Top - t / 2, t, t),
+            new RectangleF(r.Right - t / 2, r.Top - t / 2, t, t),
+            new RectangleF(r.Right - t / 2, r.Bottom - t / 2, t, t),
+            new RectangleF(r.Left - t / 2, r.Bottom - t / 2, t, t)
+        };
+    }
+
+    int AlcaEm(Point p)
+    {
+        RectangleF[] a = Alcas();
+        for (int i = 0; i < a.Length; i++)
+        {
+            RectangleF r = a[i];
+            r.Inflate(5, 5);
+            if (r.Contains(p)) return i;
+        }
+        return -1;
+    }
+
+    void ApertouFlutuante(Point p)
+    {
+        alca = AlcaEm(p);
+        inicioFlutuante = NaImagem(p);
+        posInicial = posFlutuante;
+        if (alca >= 0) return;
+        if (NaTela(posFlutuante).Contains(p)) { movendoFlutuante = true; return; }
+        Assentar();   // clicou fora: fixa onde esta
+    }
+
+    void MoveuFlutuante(Point p)
+    {
+        PointF agora = NaImagem(p);
+        if (movendoFlutuante)
+        {
+            posFlutuante.X = posInicial.X + agora.X - inicioFlutuante.X;
+            posFlutuante.Y = posInicial.Y + agora.Y - inicioFlutuante.Y;
+            tela.Invalidate();
+        }
+        else if (alca >= 0)
+        {
+            // O canto oposto fica parado e a proporcao se mantem
+            bool direita = alca == 1 || alca == 2, baixo = alca == 2 || alca == 3;
+            float fixoX = direita ? posInicial.Left : posInicial.Right;
+            float fixoY = baixo ? posInicial.Top : posInicial.Bottom;
+            float esc = Math.Max(Math.Abs(agora.X - fixoX) / posInicial.Width, Math.Abs(agora.Y - fixoY) / posInicial.Height);
+            float w = Math.Max(4, posInicial.Width * esc), h = Math.Max(4, posInicial.Height * esc);
+            posFlutuante = new RectangleF(direita ? fixoX : fixoX - w, baixo ? fixoY : fixoY - h, w, h);
+            tela.Invalidate();
+        }
+        else
+        {
+            int a = AlcaEm(p);
+            tela.Cursor = a == 0 || a == 2 ? Cursors.SizeNWSE : a == 1 || a == 3 ? Cursors.SizeNESW :
+                          NaTela(posFlutuante).Contains(p) ? Cursors.SizeAll : Cursors.Default;
+        }
+    }
+
+    public void ColocarImagem(Bitmap img)
+    {
+        Assentar();
+        flutuante = img;
+        float w = img.Width, h = img.Height;
+        // Maior que a imagem de fundo: entra reduzida, para as alcas ficarem a vista
+        float esc = Math.Min(1f, Math.Min(quadro.Largura * 0.6f / w, quadro.Altura * 0.6f / h));
+        w *= esc; h *= esc;
+        posFlutuante = new RectangleF((quadro.Largura - w) / 2, (quadro.Altura - h) / 2, w, h);
+        rotuloDica.ForeColor = Tema.Suave;
+        rotuloDica.Text = "Arraste para mover, puxe os cantos para mudar o tamanho. Enter fixa, Delete tira.";
+        tela.Invalidate();
+    }
+
+    void DescartarFlutuante()
+    {
+        if (flutuante == null) return;
+        flutuante.Dispose();
+        flutuante = null;
+        tela.Cursor = CursorDaFerramenta();
+        MostrarDica();
+        tela.Invalidate();
+    }
+
+    void MenuImagem()
+    {
+        ContextMenuStrip m = CoresMenu.NovoMenu();
+        ToolStripMenuItem arquivo = new ToolStripMenuItem("Escolher arquivo...");
+        arquivo.Click += delegate { ImagemDeArquivo(); };
+        ToolStripMenuItem colar = new ToolStripMenuItem("Colar da \u00e1rea de transfer\u00eancia (Ctrl+V)");
+        colar.Click += delegate { Colar(); };
+        colar.Enabled = Clipboard.ContainsImage();
+        m.Items.Add(arquivo);
+        m.Items.Add(colar);
+
+        bool primeira = true;
+        foreach (Item it in Historico.Itens)
+        {
+            if (!it.Imagem) continue;
+            if (primeira) { m.Items.Add(new ToolStripSeparator()); primeira = false; }
+            ToolStripMenuItem i = new ToolStripMenuItem(Tema.Hora(it.Hora) + Tema.Ponto + it.Info);
+            i.Image = it.Mini;
+            i.ImageScaling = ToolStripItemImageScaling.None;
+            string caminho = it.Caminho;
+            i.Click += delegate { ImagemDe(caminho); };
+            m.Items.Add(i);
+        }
+        m.Closed += delegate { BeginInvoke(new MethodInvoker(m.Dispose)); };
+        m.Show(botaoImagem, new Point(0, botaoImagem.Height));
+    }
+
+    void ImagemDe(string caminho)
+    {
+        try { ColocarImagem(Historico.LerImagem(caminho)); }
+        catch (Exception ex)
+        {
+            App.Log("Erro ao abrir imagem no editor: " + ex.Message);
+            Avisar("N\u00e3o consegui abrir essa imagem.", true);
+        }
+    }
+
+    void ImagemDeArquivo()
+    {
+        using (OpenFileDialog d = new OpenFileDialog())
+        {
+            d.Title = "Escolher imagem";
+            d.Filter = "Imagens|*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp|Todos os arquivos|*.*";
+            if (d.ShowDialog(this) == DialogResult.OK) ImagemDe(d.FileName);
+        }
+    }
+
+    void Colar()
+    {
+        try
+        {
+            if (!Clipboard.ContainsImage()) { Avisar("N\u00e3o tem imagem na \u00e1rea de transfer\u00eancia.", true); return; }
+            Image img = Clipboard.GetImage();
+            if (img != null) ColocarImagem(img as Bitmap ?? new Bitmap(img));
+        }
+        catch (Exception ex)
+        {
+            App.Log("Erro ao colar no editor: " + ex.Message);
+            Avisar("N\u00e3o consegui colar.", true);
+        }
+    }
+
+    // ---- Texto ----
+    int TamanhoDaFonte { get { return Math.Max(16, Tamanhos[indiceTamanho] * 4); } }
+
+    void AbrirTexto(Point p)
+    {
+        posTexto = NaImagem(p);
+        caixaTexto = new TextBox();
+        caixaTexto.Multiline = true;
+        caixaTexto.AcceptsReturn = false;
+        caixaTexto.BorderStyle = BorderStyle.None;
+        caixaTexto.Font = new Font("Segoe UI Semibold", TamanhoDaFonte * zoom, GraphicsUnit.Pixel);
+        caixaTexto.ForeColor = cor;
+        caixaTexto.BackColor = cor.GetBrightness() > 0.5f ? Color.FromArgb(30, 30, 37) : Color.FromArgb(235, 235, 240);
+        caixaTexto.Location = p;
+        caixaTexto.TextChanged += delegate { MedirTexto(); };
+        tela.Controls.Add(caixaTexto);
+        MedirTexto();
+        caixaTexto.Focus();
+    }
+
+    void MedirTexto()
+    {
+        Size t = TextRenderer.MeasureText(caixaTexto.Text.Length == 0 ? "Texto" : caixaTexto.Text + " ", caixaTexto.Font);
+        caixaTexto.Size = new Size(t.Width + 12, t.Height + 6);
+    }
+
+    void FecharTexto(bool gravar)
+    {
+        if (caixaTexto == null) return;
+        TextBox c = caixaTexto;
+        caixaTexto = null;
+        if (gravar && c.Text.Trim().Length > 0)
+            using (Font f = new Font("Segoe UI Semibold", TamanhoDaFonte, GraphicsUnit.Pixel))
+                quadro.Escrever(c.Text, f, c.ForeColor, posTexto);
+        Font velha = c.Font;
+        tela.Controls.Remove(c);
+        c.Dispose();
+        velha.Dispose();
+        tela.Focus();
+        AtualizarBotoes();
+        tela.Invalidate();
+    }
+
+    // Fixa na imagem o que ainda esta solto (imagem por cima ou texto)
+    void Assentar()
+    {
+        FecharTexto(true);
+        if (flutuante == null) return;
+        quadro.Estampar(flutuante, posFlutuante);
+        DescartarFlutuante();
+        AtualizarBotoes();
+    }
+
+    // ---- Acoes ----
+    public void Desfazer()
+    {
+        if (caixaTexto != null) { FecharTexto(false); return; }
+        if (flutuante != null) { DescartarFlutuante(); return; }
+        if (desenhando) return;
+        if (quadro.Desfazer()) DepoisDeTrocar();
+    }
+
+    public void Refazer()
+    {
+        if (desenhando || caixaTexto != null || flutuante != null) return;
+        if (quadro.Refazer()) DepoisDeTrocar();
+    }
+
+    // Desfazer um recorte muda o tamanho da imagem
+    void DepoisDeTrocar()
+    {
+        if (ajustada) Ajustar();
+        AtualizarBotoes();
+        tela.Invalidate();
+    }
+
+    public void Copiar()
+    {
+        Assentar();
+        if (App.CopiarEdicao(quadro.Imagem, quadro.Alterado))
+        {
+            quadro.MarcarSalvo();
+            Avisar("\u2713  Copiada. Cole onde quiser com Ctrl+V.", false);
+        }
+        else Avisar("N\u00e3o consegui copiar. Tente de novo.", true);
+    }
+
+    void SalvarComo()
+    {
+        Assentar();
+        using (SaveFileDialog d = new SaveFileDialog())
+        {
+            d.Title = "Salvar imagem como";
+            d.Filter = "Imagem PNG (*.png)|*.png|Imagem JPG (*.jpg)|*.jpg|Bitmap (*.bmp)|*.bmp";
+            d.FileName = "imagem-" + DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss") + ".png";
+            d.DefaultExt = "png";
+            d.AddExtension = true;
+            d.OverwritePrompt = true;
+            d.RestoreDirectory = true;
+            if (Directory.Exists(Config.PastaPrints)) d.InitialDirectory = Config.PastaPrints;
+            if (d.ShowDialog(this) != DialogResult.OK) return;
+            try
+            {
+                Historico.Gravar(quadro.Imagem, d.FileName);
+                quadro.MarcarSalvo();
+                Avisar("\u2713  Salvo em " + d.FileName, false);
+            }
+            catch (Exception ex)
+            {
+                App.Log("Erro ao salvar edicao: " + ex.Message);
+                Avisar("N\u00e3o consegui salvar: " + ex.Message, true);
+            }
+        }
+    }
+
+    // ---- Teclado ----
+    protected override bool ProcessCmdKey(ref Message msg, Keys k)
+    {
+        if (caixaTexto != null)
+        {
+            if (k == Keys.Escape) { FecharTexto(false); return true; }
+            if (k == Keys.Enter)  { FecharTexto(true); return true; }
+            if (k == (Keys.Shift | Keys.Enter))
+            {
+                caixaTexto.SelectedText = "\r\n";
+                return true;
+            }
+            return base.ProcessCmdKey(ref msg, k);
+        }
+
+        switch (k)
+        {
+            case Keys.Control | Keys.Z:              Desfazer(); return true;
+            case Keys.Control | Keys.Y:
+            case Keys.Control | Keys.Shift | Keys.Z: Refazer(); return true;
+            case Keys.Control | Keys.C:              Copiar(); return true;
+            case Keys.Control | Keys.S:              SalvarComo(); return true;
+            case Keys.Control | Keys.V:              Colar(); return true;
+            case Keys.Control | Keys.D0:
+            case Keys.Control | Keys.NumPad0:        Ajustar(); return true;
+            case Keys.OemOpenBrackets:               MudarTamanho(-1); return true;
+            case Keys.OemCloseBrackets:              MudarTamanho(1); return true;
+            case Keys.Enter:                         Assentar(); return true;
+            case Keys.Delete:                        DescartarFlutuante(); return true;
+            case Keys.Escape:
+                if (desenhando) { desenhando = false; quadro.CancelarTraco(); tela.Invalidate(); }
+                else if (recortando) { recortando = false; tela.Invalidate(); }
+                else if (flutuante != null) DescartarFlutuante();
+                else Close();
+                return true;
+            case Keys.V: TrocarFerramenta(Ferramenta.Mover); return true;
+            case Keys.L: TrocarFerramenta(Ferramenta.Lapis); return true;
+            case Keys.M: TrocarFerramenta(Ferramenta.Marca); return true;
+            case Keys.E: TrocarFerramenta(Ferramenta.Borracha); return true;
+            case Keys.B: TrocarFerramenta(Ferramenta.Borrar); return true;
+            case Keys.A: TrocarFerramenta(Ferramenta.BorrarArea); return true;
+            case Keys.S: TrocarFerramenta(Ferramenta.Seta); return true;
+            case Keys.R: TrocarFerramenta(Ferramenta.Retangulo); return true;
+            case Keys.T: TrocarFerramenta(Ferramenta.Texto); return true;
+            case Keys.C: TrocarFerramenta(Ferramenta.Recortar); return true;
+            case Keys.I: MenuImagem(); return true;
+        }
+        return base.ProcessCmdKey(ref msg, k);
+    }
+
+    protected override void OnKeyDown(KeyEventArgs e)
+    {
+        base.OnKeyDown(e);
+        if (e.KeyCode == Keys.Space && !espaco && caixaTexto == null)
+        {
+            espaco = true;
+            tela.Cursor = Cursors.Hand;
+            InvalidarPincel(mouse);
+            e.Handled = true;
+        }
+    }
+
+    protected override void OnKeyUp(KeyEventArgs e)
+    {
+        base.OnKeyUp(e);
+        if (e.KeyCode == Keys.Space && espaco)
+        {
+            espaco = false;
+            tela.Cursor = CursorDaFerramenta();
+            InvalidarPincel(mouse);
+        }
+    }
+
+    // ---- Abrir e fechar ----
+    protected override void OnShown(EventArgs e)
+    {
+        base.OnShown(e);
+        Ajustar();
+        tela.Focus();
+    }
+
+    protected override void OnFormClosing(FormClosingEventArgs e)
+    {
+        base.OnFormClosing(e);
+        if (saindo || e.CloseReason != CloseReason.UserClosing) return;
+
+        FecharTexto(true);
+        bool pendente = quadro.Alterado || flutuante != null;
+        if (pendente && MessageBox.Show(this,
+                "Fechar sem copiar nem salvar as altera\u00e7\u00f5es?",
+                "Editor de imagem", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
+        {
+            e.Cancel = true;
+            return;
+        }
+        saindo = true;
+    }
+
+    protected override void OnFormClosed(FormClosedEventArgs e)
+    {
+        base.OnFormClosed(e);
+        App.Aparar();
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            quadro.Dispose();
+            if (flutuante != null) { flutuante.Dispose(); flutuante = null; }
+            xadrez.Dispose();
+            dicas.Dispose();
+            apagaAviso.Dispose();
+            icone.Dispose();
         }
         base.Dispose(disposing);
     }
@@ -3363,6 +4809,50 @@ class App : ApplicationContext
         }, 512 * 1024);
         t.Priority = ThreadPriority.BelowNormal;
         t.Start();
+    }
+
+    // ---- Editor de imagem ----
+    // Cada editor e uma janela independente; a imagem passa a ser dele
+    public static void Editar(Bitmap img)
+    {
+        try
+        {
+            EditorImagem e = new EditorImagem(img);
+            e.Show();
+            e.Activate();
+            Nativo.SetForegroundWindow(e.Handle);
+        }
+        catch (Exception ex) { Log("Erro ao abrir o editor: " + ex.ToString()); }
+    }
+
+    // Vai como bitmap sobre branco, que todo programa cola, e tambem como PNG,
+    // para quem aceita transparencia. Se mudou, entra no historico como imagem
+    // nova: a original continua la.
+    public static bool CopiarEdicao(Bitmap img, bool alterada)
+    {
+        try
+        {
+            using (Bitmap plano = Historico.SemTransparencia(img))
+            using (MemoryStream png = new MemoryStream())
+            {
+                img.Save(png, ImageFormat.Png);
+                DataObject d = new DataObject();
+                d.SetImage(plano);
+                d.SetData("PNG", false, png);
+                Clipboard.SetDataObject(d, true, 10, 100);
+            }
+            if (instancia != null)
+            {
+                instancia.ultimaSeq = Nativo.GetClipboardSequenceNumber();
+                if (alterada) instancia.GuardarImagem(new Bitmap(img), null);
+            }
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Log("Erro ao copiar a edicao: " + ex.Message);
+            return false;
+        }
     }
 
     // ---- Janela ----
