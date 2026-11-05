@@ -8,8 +8,9 @@
 - **Salvos:** textos fixos para colar quando quiser.
 - **Emotes coloridos:** 1.715 emojis com busca em português.
 - **Prints:** janela ativa ou tela inteira, inclusive em jogos. Vão para `Imagens\PRINTS` e para a área de transferência.
+- **Recorte de tela:** `Win + Shift + S` congela a tela (todos os monitores), você arrasta a área e ela vai para a área de transferência e para o histórico. Funciona em cima de jogos e programas em tela cheia.
 - **Salvar imagem como arquivo:** PNG, JPG ou BMP.
-- **Editor de imagem:** tela cheia, com lápis, marca-texto, borracha, borrar, setas, retângulos, texto, recorte e outra imagem por cima. Abra com o botão **Editar**, `Ctrl + E` ou dois cliques na prévia. O que for borrado é substituído na própria imagem, sem como recuperar no arquivo final.
+- **Editor de imagem:** tela cheia, com lápis, marca-texto, borracha, borrar, setas, retângulos, texto, recorte e outra imagem por cima. Abra com o botão **Editar**, `Ctrl + E` ou dois cliques na prévia. O que for borrado é substituído na própria imagem, sem como recuperar no arquivo final. `Ctrl + scroll` aproxima e afasta, `Shift + scroll` anda para os lados e o scroll sozinho anda para cima e para baixo.
 - **Atalhos configuráveis**, início junto com o Windows e opção de colar sozinho.
 
 | Ação | Atalho padrão |
@@ -18,6 +19,7 @@
 | Abrir os emotes | `Win + .` |
 | Print da janela ativa | `Ctrl + Alt + J` |
 | Print da tela inteira | `Ctrl + Alt + K` |
+| Recortar parte da tela | `Win + Shift + S` |
 
 No Histórico e nos Salvos, um clique mostra o item e o duplo clique (ou Enter) copia, cola e fecha.
 

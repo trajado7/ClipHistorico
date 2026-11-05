@@ -10,6 +10,7 @@
 //    Win + . ............ emotes
 //    Ctrl + Alt + J ..... print da janela ativa (funciona dentro de jogos)
 //    Ctrl + Alt + K ..... print da tela inteira
+//    Win + Shift + S .... recortar parte da tela (funciona em tela cheia)
 //
 //  Compilar: rode o compilar.bat (usa o compilador do proprio Windows).
 //  Escrito em C# 5 para funcionar com o csc.exe do .NET Framework 4.
@@ -128,14 +129,15 @@ static class Config
     public static readonly string[] NomesPrazos = { "1 hora", "12 horas", "1 dia", "7 dias", "30 dias", "Nunca" };
 
     // Acoes que tem atalho
-    public const int AbrirHistorico = 0, AbrirEmotes = 1, PrintJanela = 2, PrintTela = 3;
+    public const int AbrirHistorico = 0, AbrirEmotes = 1, PrintJanela = 2, PrintTela = 3, RecortarTela = 4;
 
     public static readonly string[] NomesAcoes =
     {
         "Abrir a \u00e1rea de transfer\u00eancia",
         "Abrir os emotes",
         "Print da janela ativa",
-        "Print da tela inteira"
+        "Print da tela inteira",
+        "Recortar parte da tela"
     };
 
     public static readonly Atalho[] Padrao =
@@ -143,7 +145,8 @@ static class Config
         new Atalho(Atalho.Win, 0x56),                 // Win + V
         new Atalho(Atalho.Win, 0xBE),                 // Win + .
         new Atalho(Atalho.Ctrl | Atalho.Alt, 0x4A),   // Ctrl + Alt + J
-        new Atalho(Atalho.Ctrl | Atalho.Alt, 0x4B)    // Ctrl + Alt + K
+        new Atalho(Atalho.Ctrl | Atalho.Alt, 0x4B),   // Ctrl + Alt + K
+        new Atalho(Atalho.Win | Atalho.Shift, 0x53)   // Win + Shift + S
     };
 
     public static Atalho[] Atalhos = (Atalho[])Padrao.Clone();
@@ -1473,6 +1476,46 @@ static class Captura
         }
     }
 
+    // Foto de todos os monitores, para o recorte. Devolve tambem onde ela fica,
+    // em pixels reais. Se a janela da frente sair preta (alguns jogos), tenta
+    // pela propria janela e coloca o resultado na foto.
+    public static Bitmap TirarTudo(out Rectangle area)
+    {
+        IntPtr dpiAntigo = IntPtr.Zero;
+        try { dpiAntigo = Nativo.SetThreadDpiAwarenessContext(new IntPtr(-4)); } catch { }
+
+        try
+        {
+            area = SystemInformation.VirtualScreen;
+            Bitmap bmp = new Bitmap(area.Width, area.Height, PixelFormat.Format32bppRgb);
+            using (Graphics g = Graphics.FromImage(bmp))
+                g.CopyFromScreen(area.Location, Point.Empty, area.Size, CopyPixelOperation.SourceCopy);
+
+            IntPtr h = Nativo.GetForegroundWindow();
+            Rectangle jan;
+            if (JanelaValida(h, out jan))
+            {
+                Rectangle dentro = new Rectangle(jan.X - area.X, jan.Y - area.Y, jan.Width, jan.Height);
+                using (Bitmap parte = new Bitmap(jan.Width, jan.Height, PixelFormat.Format32bppRgb))
+                {
+                    using (Graphics g = Graphics.FromImage(parte))
+                        g.DrawImage(bmp, new Rectangle(0, 0, jan.Width, jan.Height), dentro, GraphicsUnit.Pixel);
+                    if (QuasePreta(parte))
+                    {
+                        TentarPrintWindow(h, jan, parte);
+                        using (Graphics g = Graphics.FromImage(bmp)) g.DrawImage(parte, dentro);
+                    }
+                }
+            }
+            return bmp;
+        }
+        finally
+        {
+            if (dpiAntigo != IntPtr.Zero)
+                try { Nativo.SetThreadDpiAwarenessContext(dpiAntigo); } catch { }
+        }
+    }
+
     public static string CaminhoNovo()
     {
         Directory.CreateDirectory(Config.PastaPrints);
@@ -1543,6 +1586,180 @@ static class Captura
                 g.DrawImage(tudo, new Rectangle(0, 0, area.Width, area.Height),
                     new Rectangle(area.Left - w.Left, area.Top - w.Top, area.Width, area.Height), GraphicsUnit.Pixel);
         }
+    }
+}
+
+// Recorte de tela. A foto e tirada antes de esta janela existir: mesmo que um
+// jogo em tela cheia perca o foco e minimize, o que se recorta e o quadro de
+// quando o atalho foi apertado.
+class TelaRecorte : Form
+{
+    readonly Bitmap foto, escura;
+    readonly Point origemDica;
+    bool selecionando;
+    Point inicio;
+    Rectangle selecao;
+
+    public Bitmap Resultado;   // quem chamou libera; null = cancelou
+
+    public TelaRecorte(Bitmap fotoDaTela, Rectangle area)
+    {
+        foto = fotoDaTela;
+        escura = new Bitmap(foto.Width, foto.Height, PixelFormat.Format32bppPArgb);
+        using (Graphics g = Graphics.FromImage(escura))
+        {
+            g.CompositingMode = CompositingMode.SourceCopy;
+            g.DrawImage(foto, new Rectangle(0, 0, foto.Width, foto.Height));
+            g.CompositingMode = CompositingMode.SourceOver;
+            using (Brush b = new SolidBrush(Color.FromArgb(120, 0, 0, 0)))
+                g.FillRectangle(b, 0, 0, foto.Width, foto.Height);
+        }
+
+        Text = "Recortar a tela";
+        FormBorderStyle = FormBorderStyle.None;
+        StartPosition   = FormStartPosition.Manual;
+        ShowInTaskbar   = false;
+        TopMost         = true;
+        KeyPreview      = true;
+        BackColor       = Color.Black;
+        Cursor          = Cursors.Cross;
+        Bounds          = area;
+
+        // Canto do monitor principal, que pode nao ser o canto da area toda
+        origemDica = new Point(area.X <= 0 && area.Right > 0 ? 24 - area.X : 24,
+                               area.Y <= 0 && area.Bottom > 0 ? 24 - area.Y : 24);
+
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+                 ControlStyles.OptimizedDoubleBuffer | ControlStyles.Opaque, true);
+    }
+
+    // A janela nasce em pixels reais, como a foto. Sem isso, com zoom de tela
+    // (125%, 150%...) o Windows esticaria a foto e o recorte sairia deslocado.
+    public void Mostrar()
+    {
+        IntPtr dpiAntigo = IntPtr.Zero;
+        try { dpiAntigo = Nativo.SetThreadDpiAwarenessContext(new IntPtr(-4)); } catch { }
+        try { Show(); }
+        finally
+        {
+            if (dpiAntigo != IntPtr.Zero)
+                try { Nativo.SetThreadDpiAwarenessContext(dpiAntigo); } catch { }
+        }
+        Activate();
+        Nativo.SetForegroundWindow(Handle);
+    }
+
+    Rectangle CaixaDoTamanho(Graphics g)
+    {
+        string t = Legenda;
+        Size s = TextRenderer.MeasureText(t, Tema.Pequena);
+        int x = selecao.Left;
+        int y = selecao.Bottom + 6;
+        if (y + s.Height + 8 > foto.Height) y = selecao.Bottom - s.Height - 14;
+        if (x + s.Width + 12 > foto.Width) x = foto.Width - s.Width - 12;
+        return new Rectangle(Math.Max(0, x), Math.Max(0, y), s.Width + 12, s.Height + 8);
+    }
+
+    string Legenda { get { return selecao.Width + " x " + selecao.Height; } }
+
+    Rectangle AreaDePintura()
+    {
+        Rectangle r = selecao;
+        using (Graphics g = CreateGraphics()) r = Rectangle.Union(r, CaixaDoTamanho(g));
+        r.Inflate(3, 3);
+        return r;
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        Graphics g = e.Graphics;
+        Rectangle c = e.ClipRectangle;
+        g.CompositingMode = CompositingMode.SourceCopy;
+        g.DrawImage(escura, c, c, GraphicsUnit.Pixel);
+
+        if (selecao.Width > 0 && selecao.Height > 0)
+        {
+            g.DrawImage(foto, selecao, selecao, GraphicsUnit.Pixel);
+            g.CompositingMode = CompositingMode.SourceOver;
+            using (Pen p = new Pen(Tema.Destaque, 2))
+                g.DrawRectangle(p, selecao.X - 1, selecao.Y - 1, selecao.Width + 1, selecao.Height + 1);
+
+            Rectangle r = CaixaDoTamanho(g);
+            g.FillRectangle(Tema.Pincel(Color.FromArgb(235, 20, 20, 26)), r);
+            TextRenderer.DrawText(g, Legenda, Tema.Pequena, r, Color.White,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+        }
+        else
+        {
+            g.CompositingMode = CompositingMode.SourceOver;
+            const string dica = "Arraste para recortar  •  Esc ou botão direito cancela";
+            Size s = TextRenderer.MeasureText(dica, Tema.Normal);
+            Rectangle r = new Rectangle(origemDica.X, origemDica.Y, s.Width + 24, s.Height + 14);
+            g.FillRectangle(Tema.Pincel(Color.FromArgb(235, 20, 20, 26)), r);
+            TextRenderer.DrawText(g, dica, Tema.Normal, r, Color.White,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+        }
+    }
+
+    protected override void OnMouseDown(MouseEventArgs e)
+    {
+        base.OnMouseDown(e);
+        if (e.Button == MouseButtons.Right) { Close(); return; }
+        if (e.Button != MouseButtons.Left) return;
+        selecionando = true;
+        inicio = e.Location;
+        selecao = Rectangle.Empty;
+        Invalidate();
+    }
+
+    protected override void OnMouseMove(MouseEventArgs e)
+    {
+        base.OnMouseMove(e);
+        if (!selecionando) return;
+        Rectangle velha = AreaDePintura();
+        int x = Math.Max(0, Math.Min(foto.Width, e.X)), y = Math.Max(0, Math.Min(foto.Height, e.Y));
+        selecao = Rectangle.FromLTRB(Math.Min(inicio.X, x), Math.Min(inicio.Y, y), Math.Max(inicio.X, x), Math.Max(inicio.Y, y));
+        Invalidate(Rectangle.Union(velha, AreaDePintura()));
+    }
+
+    protected override void OnMouseUp(MouseEventArgs e)
+    {
+        base.OnMouseUp(e);
+        if (!selecionando || e.Button != MouseButtons.Left) return;
+        selecionando = false;
+
+        // Clique sem arrastar nao recorta: continua esperando
+        if (selecao.Width < 3 || selecao.Height < 3)
+        {
+            selecao = Rectangle.Empty;
+            Invalidate();
+            return;
+        }
+
+        Bitmap b = new Bitmap(selecao.Width, selecao.Height, PixelFormat.Format32bppRgb);
+        using (Graphics g = Graphics.FromImage(b))
+        {
+            g.CompositingMode = CompositingMode.SourceCopy;
+            g.DrawImage(foto, new Rectangle(0, 0, b.Width, b.Height), selecao, GraphicsUnit.Pixel);
+        }
+        Resultado = b;
+        Close();
+    }
+
+    protected override bool ProcessCmdKey(ref Message msg, Keys k)
+    {
+        if (k == Keys.Escape) { Close(); return true; }
+        return base.ProcessCmdKey(ref msg, k);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            foto.Dispose();
+            escura.Dispose();
+        }
+        base.Dispose(disposing);
     }
 }
 
@@ -3901,7 +4118,7 @@ class EditorImagem : Form
         string d;
         switch (ferramenta)
         {
-            case Ferramenta.Mover:      d = "Arraste para mover a imagem na tela. A roda do mouse aproxima."; break;
+            case Ferramenta.Mover:      d = "Arraste para mover a imagem. Ctrl + roda aproxima, Shift + roda anda para os lados."; break;
             case Ferramenta.Lapis:      d = "Arraste para rabiscar."; break;
             case Ferramenta.Marca:      d = "Arraste para grifar."; break;
             case Ferramenta.Borracha:   d = "Arraste para apagar: o que sair fica transparente."; break;
@@ -3981,22 +4198,42 @@ class EditorImagem : Form
         tela.Invalidate();
     }
 
-    void Roda(object s, MouseEventArgs e)
-    {
-        if (desenhando || recortando) return;
-        if ((ModifierKeys & Keys.Control) != 0) { MudarTamanho(e.Delta > 0 ? 1 : -1); return; }
+    void Roda(object s, MouseEventArgs e) { Rolar(e.Delta, ModifierKeys, e.Location); }
 
-        Assentar();
-        float novo = Math.Max(0.05f, Math.Min(16f, zoom * (e.Delta > 0 ? 1.25f : 0.8f)));
-        // Quase 100%: encaixa, para os pixels nao ficarem interpolados
-        if (Math.Abs(novo - 1f) < 0.08f) novo = 1f;
-        PointF ponto = NaImagem(e.Location);
-        zoom = novo;
-        ox = (float)Math.Round(e.X - ponto.X * zoom);
-        oy = (float)Math.Round(e.Y - ponto.Y * zoom);
+    // Como no Canva: Ctrl aproxima e afasta, Shift anda para os lados, sozinha
+    // anda para cima e para baixo. A imagem solta nao e fixada: ela acompanha.
+    public void Rolar(int delta, Keys mods, Point p)
+    {
+        if (desenhando || recortando || delta == 0) return;
+        FecharTexto(true);
+
+        if ((mods & Keys.Control) != 0)
+        {
+            float novo = Math.Max(0.05f, Math.Min(16f, zoom * (delta > 0 ? 1.25f : 0.8f)));
+            // Quase 100%: encaixa, para os pixels nao ficarem interpolados
+            if (Math.Abs(novo - 1f) < 0.08f) novo = 1f;
+            PointF ponto = NaImagem(p);
+            zoom = novo;
+            ox = (float)Math.Round(p.X - ponto.X * zoom);
+            oy = (float)Math.Round(p.Y - ponto.Y * zoom);
+        }
+        else
+        {
+            float passo = delta / 2f;   // 60 pixels por dente da roda
+            if ((mods & Keys.Shift) != 0) ox = Deslizar(ox, quadro.Largura * zoom, tela.ClientSize.Width, passo);
+            else                          oy = Deslizar(oy, quadro.Altura * zoom, tela.ClientSize.Height, passo);
+        }
         ajustada = false;
         AtualizarBotoes();
         tela.Invalidate();
+    }
+
+    // Imagem que cabe nao anda; a que nao cabe para na beirada, sem sumir da tela
+    static float Deslizar(float posicao, float tamanho, float espaco, float passo)
+    {
+        const float folga = 16;
+        if (tamanho + folga * 2 <= espaco) return posicao;
+        return Math.Max(espaco - tamanho - folga, Math.Min(folga, posicao + passo));
     }
 
     void InvalidarImagem(Rectangle r)
@@ -4582,6 +4819,7 @@ class App : ApplicationContext
     Janela janela;
     IntPtr anterior;
     uint ultimaSeq;
+    TelaRecorte recorte;
     int tentativas;
     bool pausado;
     readonly SynchronizationContext contexto;
@@ -4645,6 +4883,9 @@ class App : ApplicationContext
         ToolStripMenuItem config = new ToolStripMenuItem("Configura\u00e7\u00f5es");
         config.Click += delegate { Abrir(Janela.PgConfig); };
 
+        ToolStripMenuItem recortar = new ToolStripMenuItem("Recortar parte da tela");
+        recortar.Click += delegate { RecortarTela(); };
+
         ToolStripMenuItem pausar = new ToolStripMenuItem("Pausar captura");
         pausar.CheckOnClick = true;
         pausar.CheckedChanged += delegate
@@ -4672,7 +4913,7 @@ class App : ApplicationContext
         sair.Click += delegate { ExitThread(); };
 
         menu.Items.AddRange(new ToolStripItem[] {
-            abrir, salvos, emotes, config, new ToolStripSeparator(),
+            abrir, salvos, emotes, recortar, config, new ToolStripSeparator(),
             pausar, pasta, new ToolStripSeparator(), limpar, sair });
         return menu;
     }
@@ -4686,6 +4927,7 @@ class App : ApplicationContext
             case Config.AbrirEmotes:    Alternar(Janela.PgEmotes); break;
             case Config.PrintJanela:    TirarPrint(false); break;
             case Config.PrintTela:      TirarPrint(true); break;
+            case Config.RecortarTela:   RecortarTela(); break;
         }
     }
 
@@ -4751,19 +4993,53 @@ class App : ApplicationContext
     {
         try
         {
-            Bitmap bmp = Captura.Tirar(telaInteira);
-            try
-            {
-                Clipboard.SetDataObject(bmp, true, 10, 100);
-                // Ja vai direto para o historico: nao precisa ler de volta
-                ultimaSeq = Nativo.GetClipboardSequenceNumber();
-            }
-            catch (Exception ex) { Log("Erro ao copiar o print: " + ex.Message); }
-
-            if (Config.SomAoCapturar) Som.Tocar();
-            GuardarImagem(bmp, Captura.CaminhoNovo());
+            Entregar(Captura.Tirar(telaInteira), Captura.CaminhoNovo());
         }
         catch (Exception ex) { Log("Erro ao tirar print: " + ex.Message); }
+    }
+
+    // A imagem passa a pertencer a este metodo
+    void Entregar(Bitmap bmp, string arquivoPrint)
+    {
+        try
+        {
+            Clipboard.SetDataObject(bmp, true, 10, 100);
+            // Ja vai direto para o historico: nao precisa ler de volta
+            ultimaSeq = Nativo.GetClipboardSequenceNumber();
+        }
+        catch (Exception ex) { Log("Erro ao copiar o print: " + ex.Message); }
+
+        if (Config.SomAoCapturar) Som.Tocar();
+        GuardarImagem(bmp, arquivoPrint);
+    }
+
+    // Vai para a area de transferencia e para o historico. O foco volta para
+    // onde estava, para o jogo nao ficar minimizado depois do recorte.
+    void RecortarTela()
+    {
+        if (recorte != null) return;   // ja esta aberto
+        try
+        {
+            IntPtr antes = Nativo.GetForegroundWindow();
+            Rectangle area;
+            Bitmap foto = Captura.TirarTudo(out area);
+            recorte = new TelaRecorte(foto, area);
+            recorte.FormClosed += delegate
+            {
+                Bitmap feito = recorte.Resultado;
+                TelaRecorte fechada = recorte;
+                recorte = null;
+                contexto.Post(delegate { fechada.Dispose(); Aparar(); }, null);
+                if (antes != IntPtr.Zero) Nativo.SetForegroundWindow(antes);
+                if (feito != null) Entregar(feito, null);
+            };
+            recorte.Mostrar();
+        }
+        catch (Exception ex)
+        {
+            recorte = null;
+            Log("Erro ao abrir o recorte: " + ex.ToString());
+        }
     }
 
     // Grava a imagem fora da thread da janela: um PNG grande leva centenas de

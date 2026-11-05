@@ -292,6 +292,136 @@ static class Teste
         ed.Dispose();
     }
 
+    // ---- Rolagem do editor e recorte de tela ----
+    static float Campo(EditorImagem ed, string nome)
+    {
+        return (float)typeof(EditorImagem).GetField(nome, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic).GetValue(ed);
+    }
+
+    static void TestarRolagemERecorte(string saida)
+    {
+        EditorImagem ed = new EditorImagem(Listras(3000, 2000));
+        ed.Location = new Point(-6000, 0);
+        ed.Show();
+        Application.DoEvents();
+        ed.Ajustar();
+        Point meio = new Point(500, 400);
+
+        float z0 = Campo(ed, "zoom"), x0 = Campo(ed, "ox"), y0 = Campo(ed, "oy");
+        ed.Rolar(120, Keys.Shift, meio);
+        Ok(Campo(ed, "ox") == x0 && Campo(ed, "oy") == y0, "imagem que cabe nao anda");
+
+        ed.Rolar(120, Keys.Control, meio);
+        Ok(Campo(ed, "zoom") > z0, "ctrl + scroll aproxima");
+        float z1 = Campo(ed, "zoom");
+        ed.Rolar(-120, Keys.Control, meio);
+        Ok(Campo(ed, "zoom") < z1, "ctrl + scroll afasta");
+
+        for (int i = 0; i < 8; i++) ed.Rolar(120, Keys.Control, meio);
+        float z2 = Campo(ed, "zoom");
+        PointF antes = new PointF(Campo(ed, "ox"), Campo(ed, "oy"));
+
+        ed.Rolar(-120, Keys.Shift, meio);
+        Ok(Campo(ed, "ox") == antes.X - 60 && Campo(ed, "oy") == antes.Y, "shift + scroll para baixo vai para a direita");
+        ed.Rolar(120, Keys.Shift, meio);
+        Ok(Campo(ed, "ox") == antes.X, "shift + scroll para cima vai para a esquerda");
+        ed.Rolar(-120, Keys.None, meio);
+        Ok(Campo(ed, "oy") == antes.Y - 60 && Campo(ed, "ox") == antes.X, "scroll sozinho anda para baixo");
+        Ok(Campo(ed, "zoom") == z2, "andar nao muda o zoom");
+
+        for (int i = 0; i < 400; i++) ed.Rolar(-120, Keys.Shift, meio);
+        TelaEditor tela = Achar<TelaEditor>(ed);
+        Ok(Math.Abs(Campo(ed, "ox") + 3000 * z2 - tela.ClientSize.Width + 16) < 1, "para na beirada direita");
+
+        // ponto embaixo do mouse fica no lugar ao aproximar
+        ed.Ajustar();
+        PointF img1 = new PointF((meio.X - Campo(ed, "ox")) / Campo(ed, "zoom"), (meio.Y - Campo(ed, "oy")) / Campo(ed, "zoom"));
+        ed.Rolar(120, Keys.Control, meio);
+        PointF img2 = new PointF((meio.X - Campo(ed, "ox")) / Campo(ed, "zoom"), (meio.Y - Campo(ed, "oy")) / Campo(ed, "zoom"));
+        Ok(Math.Abs(img1.X - img2.X) < 2 && Math.Abs(img1.Y - img2.Y) < 2, "aproxima no ponto do mouse");
+
+        // imagem solta nao e fixada pela rolagem
+        Bitmap solta = new Bitmap(100, 100);
+        ed.ColocarImagem(solta);
+        ed.Rolar(120, Keys.Control, meio);
+        ed.Rolar(-120, Keys.None, meio);
+        Quadro q = null;
+        foreach (System.Reflection.FieldInfo fi in typeof(EditorImagem).GetFields(System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic))
+            if (fi.FieldType == typeof(Quadro)) q = (Quadro)fi.GetValue(ed);
+        Ok(!q.Alterado, "rolar nao fixa a imagem solta");
+        ed.Desfazer();
+        ed.Dispose();
+
+        // Foto da tela inteira
+        Rectangle area;
+        using (Bitmap tudo = Captura.TirarTudo(out area))
+        {
+            Ok(tudo.Width == area.Width && tudo.Height == area.Height && tudo.Width > 100, "foto da tela " + tudo.Width + "x" + tudo.Height);
+        }
+
+        // Recorte, fora da area visivel, com uma foto conhecida
+        Func<Bitmap> fotoTeste = () =>
+        {
+            Bitmap b = new Bitmap(800, 600, PixelFormat.Format32bppRgb);
+            using (Graphics g = Graphics.FromImage(b))
+            {
+                g.Clear(Color.White);
+                g.FillRectangle(Brushes.Red, 100, 100, 200, 150);
+            }
+            return b;
+        };
+        Rectangle fora = new Rectangle(-6000, 0, 800, 600);
+
+        TelaRecorte r = new TelaRecorte(fotoTeste(), fora);
+        r.Mostrar();
+        Application.DoEvents();
+        Ok(r.ClientSize.Width == 800 && r.ClientSize.Height == 600, "janela do recorte do tamanho da foto (" + r.ClientSize.Width + "x" + r.ClientSize.Height + ")");
+        FotoForm(r, Path.Combine(saida, "recorte-vazio.png"));
+
+        Nativo.SendMessage(r.Handle, 0x0201, new IntPtr(1), Pos(new Point(10, 10)));
+        Nativo.SendMessage(r.Handle, 0x0202, IntPtr.Zero, Pos(new Point(10, 10)));
+        Application.DoEvents();
+        Ok(r.Resultado == null && !r.IsDisposed && r.Visible, "clique sem arrastar nao recorta");
+
+        Nativo.SendMessage(r.Handle, 0x0201, new IntPtr(1), Pos(new Point(100, 100)));
+        Nativo.SendMessage(r.Handle, 0x0200, new IntPtr(1), Pos(new Point(200, 150)));
+        Nativo.SendMessage(r.Handle, 0x0200, new IntPtr(1), Pos(new Point(300, 250)));
+        Application.DoEvents();
+        FotoForm(r, Path.Combine(saida, "recorte-selecao.png"));
+        Nativo.SendMessage(r.Handle, 0x0202, IntPtr.Zero, Pos(new Point(300, 250)));
+        Application.DoEvents();
+        Ok(r.Resultado != null && r.Resultado.Width == 200 && r.Resultado.Height == 150, "tamanho recortado");
+        if (r.Resultado != null)
+        {
+            Color c1 = r.Resultado.GetPixel(0, 0), c2 = r.Resultado.GetPixel(199, 149);
+            Ok(c1.R == 255 && c1.G == 0 && c2.R == 255 && c2.G == 0, "recorte pega os pixels certos, sem escurecer");
+            r.Resultado.Dispose();
+        }
+
+        // arrastar ao contrario e passar da beirada
+        r = new TelaRecorte(fotoTeste(), fora);
+        r.Mostrar();
+        Application.DoEvents();
+        Nativo.SendMessage(r.Handle, 0x0201, new IntPtr(1), Pos(new Point(700, 500)));
+        Nativo.SendMessage(r.Handle, 0x0200, new IntPtr(1), Pos(new Point(-50, -50)));
+        Nativo.SendMessage(r.Handle, 0x0202, IntPtr.Zero, Pos(new Point(-50, -50)));
+        Application.DoEvents();
+        Ok(r.Resultado != null && r.Resultado.Width == 700 && r.Resultado.Height == 500, "arrastar ao contrario ate a beirada");
+        if (r.Resultado != null) r.Resultado.Dispose();
+
+        // cancelar
+        r = new TelaRecorte(fotoTeste(), fora);
+        r.Mostrar();
+        Application.DoEvents();
+        Nativo.SendMessage(r.Handle, 0x0204, new IntPtr(2), Pos(new Point(50, 50)));
+        Application.DoEvents();
+        Ok(r.Resultado == null && (r.IsDisposed || !r.Visible), "botao direito cancela");
+        r.Dispose();
+
+        Ok(Config.Atalhos[Config.RecortarTela].Mods == (Atalho.Win | Atalho.Shift) && Config.Atalhos[Config.RecortarTela].Vk == 0x53, "atalho padrao Win + Shift + S");
+        Ok(Config.Atalhos.Length == Config.NomesAcoes.Length, "todo atalho tem nome");
+    }
+
     public static void Rodar(string[] args)
     {
         string saida = args[0];
@@ -459,6 +589,7 @@ static class Teste
         EmojiCor.Liberar();
 
         TestarEditor(saida);
+        TestarRolagemERecorte(saida);
 
         Console.WriteLine(falhas == 0 ? "TUDO OK" : "FALHAS: " + falhas);
         Environment.Exit(falhas == 0 ? 0 : 1);
