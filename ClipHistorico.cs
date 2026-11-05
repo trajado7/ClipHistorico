@@ -122,6 +122,11 @@ static class Config
     public static bool ColarAuto     = false;
     public static bool SomAoCapturar = true;
 
+    // Prazo do historico em horas (0 = nunca apaga por tempo)
+    public static int PrazoHoras = 24;
+    public static readonly int[] Prazos = { 1, 12, 24, 168, 720, 0 };
+    public static readonly string[] NomesPrazos = { "1 hora", "12 horas", "1 dia", "7 dias", "30 dias", "Nunca" };
+
     // Acoes que tem atalho
     public const int AbrirHistorico = 0, AbrirEmotes = 1, PrintJanela = 2, PrintTela = 3;
 
@@ -159,6 +164,11 @@ static class Config
 
                 if (chave == "ColarAuto") ColarAuto = valor == "1";
                 else if (chave == "Som") SomAoCapturar = valor == "1";
+                else if (chave == "PrazoHoras")
+                {
+                    int h;
+                    if (int.TryParse(valor, out h) && h >= 0) PrazoHoras = h;
+                }
                 else if (chave.StartsWith("Atalho"))
                 {
                     int i, mods, vk;
@@ -180,6 +190,7 @@ static class Config
             StringBuilder sb = new StringBuilder();
             sb.AppendLine("ColarAuto=" + (ColarAuto ? "1" : "0"));
             sb.AppendLine("Som=" + (SomAoCapturar ? "1" : "0"));
+            sb.AppendLine("PrazoHoras=" + PrazoHoras);
             for (int i = 0; i < Atalhos.Length; i++)
                 sb.AppendLine("Atalho" + i + "=" + Atalhos[i].Mods + "," + Atalhos[i].Vk);
             File.WriteAllText(Arquivo, sb.ToString());
@@ -218,6 +229,7 @@ static class Nativo
     [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr GetModuleHandle(string name);
+    [DllImport("winmm.dll")] public static extern bool PlaySound(IntPtr som, IntPtr modulo, uint opcoes);
     [DllImport("kernel32.dll")] public static extern IntPtr GetCurrentProcess();
     [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
     [DllImport("kernel32.dll", EntryPoint = "RtlMoveMemory")] public static extern void CopiarMemoria(IntPtr destino, IntPtr origem, IntPtr bytes);
@@ -531,6 +543,32 @@ static class Historico
             catch (Exception ex) { App.Log("Nao foi possivel ler " + f + ": " + ex.Message); }
         }
         Limitar();
+        Expirar(DateTime.Now);
+    }
+
+    // Apaga o que passou do prazo escolhido e diz quantos itens saíram.
+    // Vale para o historico; textos salvos e a pasta de prints nao entram.
+    public static int Expirar(DateTime agora)
+    {
+        if (Config.PrazoHoras <= 0) return 0;
+        DateTime limite = agora.AddHours(-Config.PrazoHoras);
+        int apagados = 0;
+        for (int i = Itens.Count - 1; i >= 0; i--)
+        {
+            if (Itens[i].Hora >= limite) continue;
+            Remover(Itens[i]);
+            apagados++;
+        }
+        return apagados;
+    }
+
+    // Quando o item mais antigo vence (null = nada para vencer)
+    public static DateTime? ProximoVencimento()
+    {
+        if (Config.PrazoHoras <= 0 || Itens.Count == 0) return null;
+        DateTime velho = DateTime.MaxValue;
+        foreach (Item it in Itens) if (it.Hora < velho) velho = it.Hora;
+        return velho.AddHours(Config.PrazoHoras);
     }
 
     // So e do historico o arquivo com o nome que o proprio programa da
@@ -1317,6 +1355,76 @@ class Nucleo : NativeWindow, IDisposable
 
 
 // ---------------------------------------------------------------------
+// 6a. SOM DO PRINT
+//
+// O som de sistema do Windows depende do esquema de sons e do canal "Sons
+// do sistema", que pode estar mudo ou baixo. Este e um clique de camera
+// gerado aqui mesmo: toca no volume normal e nao precisa de arquivo.
+// ---------------------------------------------------------------------
+static class Som
+{
+    const uint Assincrono = 1, SemPadrao = 2, DaMemoria = 4;
+    const int Amostras = 22050;
+    static IntPtr wav;   // fica na memoria nao gerenciada: o toque continua depois da chamada
+
+    public static byte[] GerarWav()
+    {
+        int total = Amostras * 16 / 100;   // 160 ms
+        short[] sons = new short[total];
+        Random ruido = new Random(7);
+        for (int i = 0; i < total; i++)
+        {
+            double t = (double)i / Amostras;
+            // Dois estalos: a cortina abrindo e fechando
+            double a = t < 0.05 ? Math.Exp(-t * 180) : 0;
+            double b = t >= 0.07 ? Math.Exp(-(t - 0.07) * 120) : 0;
+            double v = (a + b * 0.8) * (0.65 * (ruido.NextDouble() * 2 - 1) + 0.35 * Math.Sin(2 * Math.PI * 1500 * t));
+            sons[i] = (short)(Math.Max(-1, Math.Min(1, v)) * 26000);
+        }
+
+        using (MemoryStream ms = new MemoryStream(44 + total * 2))
+        using (BinaryWriter w = new BinaryWriter(ms))
+        {
+            w.Write(Encoding.ASCII.GetBytes("RIFF"));
+            w.Write(36 + total * 2);
+            w.Write(Encoding.ASCII.GetBytes("WAVEfmt "));
+            w.Write(16);
+            w.Write((short)1);          // PCM
+            w.Write((short)1);          // mono
+            w.Write(Amostras);
+            w.Write(Amostras * 2);
+            w.Write((short)2);
+            w.Write((short)16);
+            w.Write(Encoding.ASCII.GetBytes("data"));
+            w.Write(total * 2);
+            foreach (short a in sons) w.Write(a);
+            w.Flush();
+            return ms.ToArray();
+        }
+    }
+
+    public static bool Tocar(uint extra = Assincrono)
+    {
+        try
+        {
+            if (wav == IntPtr.Zero)
+            {
+                byte[] b = GerarWav();
+                wav = Marshal.AllocHGlobal(b.Length);
+                Marshal.Copy(b, 0, wav, b.Length);
+            }
+            return Nativo.PlaySound(wav, IntPtr.Zero, extra | SemPadrao | DaMemoria);
+        }
+        catch (Exception ex)
+        {
+            App.Log("Erro ao tocar o som: " + ex.Message);
+            return false;
+        }
+    }
+}
+
+
+// ---------------------------------------------------------------------
 // 6b. PRINT (janela ativa ou tela inteira)
 // ---------------------------------------------------------------------
 
@@ -1846,6 +1954,7 @@ class Janela : Form
     Label[] caixasAtalho;
     Label msgConfig;
     Interruptor optColar, optSom, optIniciar;
+    Label[] botoesPrazo;
     int gravando = -1;
 
     // Sombra em volta da janela
@@ -2012,8 +2121,8 @@ class Janela : Form
         Label l = NovoRotulo(texto, Tema.Negrito, Tema.Texto, fundo);
         l.TextAlign = ContentAlignment.MiddleCenter;
         l.Cursor = Cursors.Hand;
-        l.MouseEnter += delegate { l.BackColor = fundoSob; };
-        l.MouseLeave += delegate { l.BackColor = fundo; };
+        l.MouseEnter += delegate { if (l.BackColor == fundo) l.BackColor = fundoSob; };
+        l.MouseLeave += delegate { if (l.BackColor == fundoSob) l.BackColor = fundo; };
         return l;
     }
 
@@ -2731,7 +2840,32 @@ class Janela : Form
         optColar.Mudou   += delegate { Config.ColarAuto = optColar.Marcado; Config.Salvar(); };
         optSom.Mudou     += delegate { Config.SomAoCapturar = optSom.Marcado; Config.Salvar(); };
         optIniciar.Mudou += delegate { App.DefinirIniciar(optIniciar.Marcado); };
-        y += 14;
+        y += 6;
+
+        pg.Controls.Add(Posicionar(NovoRotulo("Apagar do hist\u00f3rico depois de", Tema.Normal, Tema.Texto, Tema.Painel), 24, y, 240, 32));
+        botoesPrazo = new Label[Config.Prazos.Length];
+        for (int i = 0; i < Config.Prazos.Length; i++)
+        {
+            int horas = Config.Prazos[i];
+            Label b = BotaoCheio(Config.NomesPrazos[i], Tema.Campo, Tema.CampoSob);
+            b.Font = Tema.Pequena;
+            Posicionar(b, 270 + i * 70, y, 66, 32);
+            b.TextAlign = ContentAlignment.MiddleCenter;
+            b.MouseDown += delegate
+            {
+                Config.PrazoHoras = horas;
+                Config.Salvar();
+                AtualizarConfig();
+                App.PrazoMudou();
+            };
+            botoesPrazo[i] = b;
+            pg.Controls.Add(b);
+        }
+        y += 36;
+        pg.Controls.Add(Posicionar(NovoRotulo(
+            "Vale para textos e imagens do hist\u00f3rico. Os textos salvos e a pasta de prints n\u00e3o s\u00e3o apagados.",
+            Tema.Pequena, Tema.Suave, Tema.Painel), 24, y, 640, 20));
+        y += 34;
 
         pg.Controls.Add(LinhaPasta(24, ref y, "Prints: ", Config.PastaPrints));
         pg.Controls.Add(LinhaPasta(24, ref y, "Hist\u00f3rico: ", Config.Pasta));
@@ -2779,6 +2913,12 @@ class Janela : Form
         optColar.Marcado   = Config.ColarAuto;
         optSom.Marcado     = Config.SomAoCapturar;
         optIniciar.Marcado = App.IniciaComWindows();
+        for (int i = 0; i < botoesPrazo.Length; i++)
+        {
+            bool ativo = Config.Prazos[i] == Config.PrazoHoras;
+            botoesPrazo[i].BackColor = ativo ? Tema.Destaque : Tema.Campo;
+            botoesPrazo[i].ForeColor = ativo ? Color.White : Tema.Texto;
+        }
     }
 
     void IniciarGravacao(int i)
@@ -2991,6 +3131,8 @@ class App : ApplicationContext
     readonly NotifyIcon bandeja;
     readonly Icon icone;
     readonly Timer repetir;
+    readonly Timer limpeza;
+    static App instancia;
     Janela janela;
     IntPtr anterior;
     uint ultimaSeq;
@@ -3015,6 +3157,12 @@ class App : ApplicationContext
         repetir = new Timer();
         repetir.Interval = 150;
         repetir.Tick += delegate { repetir.Stop(); LerAreaDeTransferencia(); };
+
+        // Acorda so quando o proximo item vence, em vez de ficar verificando
+        instancia = this;
+        limpeza = new Timer();
+        limpeza.Tick += delegate { LimparVencidos(); };
+        AgendarLimpeza();
 
         icone = Tema.CriarIcone();
         bandeja = new NotifyIcon();
@@ -3126,6 +3274,32 @@ class App : ApplicationContext
         }
     }
 
+    // ---- Prazo do historico ----
+    void LimparVencidos()
+    {
+        if (Historico.Expirar(DateTime.Now) > 0)
+        {
+            if (janela != null) janela.Recarregar();
+            Aparar();
+        }
+        AgendarLimpeza();
+    }
+
+    void AgendarLimpeza()
+    {
+        limpeza.Stop();
+        if (Config.PrazoHoras <= 0) return;
+        DateTime? vence = Historico.ProximoVencimento();
+        double ms = vence.HasValue ? (vence.Value - DateTime.Now).TotalMilliseconds + 1000 : 3600000;
+        limpeza.Interval = (int)Math.Max(60000, Math.Min(3600000, ms));
+        limpeza.Start();
+    }
+
+    public static void PrazoMudou()
+    {
+        if (instancia != null) instancia.LimparVencidos();
+    }
+
     // ---- Print ----
     void TirarPrint(bool telaInteira)
     {
@@ -3140,7 +3314,7 @@ class App : ApplicationContext
             }
             catch (Exception ex) { Log("Erro ao copiar o print: " + ex.Message); }
 
-            if (Config.SomAoCapturar) System.Media.SystemSounds.Asterisk.Play();
+            if (Config.SomAoCapturar) Som.Tocar();
             GuardarImagem(bmp, Captura.CaminhoNovo());
         }
         catch (Exception ex) { Log("Erro ao tirar print: " + ex.Message); }
@@ -3207,6 +3381,7 @@ class App : ApplicationContext
             return;
         }
         anterior = Nativo.GetForegroundWindow();
+        Historico.Expirar(DateTime.Now);
         janela = new Janela(nucleo, pagina);
         janela.FormClosed += delegate { JanelaFechou(); };
         janela.Show();
@@ -3328,6 +3503,7 @@ class App : ApplicationContext
     {
         if (janela != null) janela.Close();
         repetir.Dispose();
+        limpeza.Dispose();
         bandeja.Visible = false;
         bandeja.Dispose();
         nucleo.Dispose();

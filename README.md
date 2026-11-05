@@ -4,7 +4,7 @@
 
 ## O que faz
 
-- **Histórico:** guarda os últimos 50 textos e 10 imagens copiados, com busca e prévia.
+- **Histórico:** guarda até 50 textos e 10 imagens copiados, com busca e prévia. Apaga sozinho depois do prazo que você escolher (1 hora a 30 dias, ou nunca; padrão de 1 dia).
 - **Salvos:** textos fixos para colar quando quiser.
 - **Emotes coloridos:** 1.715 emojis com busca em português.
 - **Prints:** janela ativa ou tela inteira, inclusive em jogos. Vão para `Imagens\PRINTS` e para a área de transferência.
@@ -36,7 +36,7 @@ Rode o `compilar.bat`. Ele usa o compilador que já vem no Windows, fecha o prog
 | Prints | `Imagens\PRINTS` |
 | Salvos e configurações | `%APPDATA%\ClipHistorico` |
 
-O histórico fica em arquivos comuns, sem criptografia. Tudo o que você copiar, inclusive senhas, é gravado nessa pasta até sair da lista ou ser apagado. Use **Pausar captura** no ícone perto do relógio para evitar isso.
+O histórico fica em arquivos comuns, sem criptografia. Tudo o que você copiar, inclusive senhas, é gravado nessa pasta até vencer o prazo, sair da lista ou ser apagado. Use **Pausar captura** no ícone perto do relógio para evitar isso.
 
 ## Testes
 

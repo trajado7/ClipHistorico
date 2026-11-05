@@ -97,6 +97,36 @@ static class Teste
         }
         using (Bitmap p = Historico.LerPrevia(png, 100, 100)) Ok(p.Width == 100 && p.Height == 62, "previa reduzida");
 
+        // prazo do historico
+        Historico.Itens.Clear();
+        string velho = Path.Combine(saida, "20261101_100000000.txt");
+        string novo = Path.Combine(saida, "20261105_100000000.txt");
+        File.WriteAllText(velho, "velho"); File.WriteAllText(novo, "novo");
+        Historico.Itens.Add(Item.DeTexto(novo, "novo"));
+        Historico.Itens.Add(Item.DeTexto(velho, "velho"));
+        DateTime agora = new DateTime(2026, 11, 5, 12, 0, 0);
+        Config.PrazoHoras = 0;
+        Ok(Historico.Expirar(agora) == 0 && !Historico.ProximoVencimento().HasValue, "Nunca nao apaga");
+        Config.PrazoHoras = 168;
+        Ok(Historico.Expirar(agora) == 0 && Historico.Itens.Count == 2, "7 dias mantem item de 4 dias");
+        Config.PrazoHoras = 24;
+        Ok(Historico.ProximoVencimento() == new DateTime(2026, 11, 2, 10, 0, 0), "proximo vencimento");
+        Ok(Historico.Expirar(agora) == 1 && !File.Exists(velho) && File.Exists(novo), "1 dia apaga so o vencido");
+        Ok(Historico.Itens.Count == 1 && Historico.Itens[0].Texto == "novo", "item novo continua");
+        Historico.Itens.Clear();
+        File.Delete(novo);
+
+        // som proprio
+        byte[] wav = Som.GerarWav();
+        Ok(wav.Length == 44 + 3528 * 2 && wav[0] == 'R' && wav[8] == 'W' && BitConverter.ToInt32(wav, 40) == 3528 * 2, "wav valido");
+        int pico = 0;
+        for (int i = 44; i + 1 < wav.Length; i += 2) pico = Math.Max(pico, Math.Abs((int)BitConverter.ToInt16(wav, i)));
+        Console.WriteLine("pico do som: " + pico);
+        Ok(pico > 8000, "som tem volume");
+        Stopwatch ts = Stopwatch.StartNew();
+        Ok(Som.Tocar(0), "Windows aceitou tocar o som");   // 0 = espera terminar
+        Console.WriteLine("tocou por " + ts.ElapsedMilliseconds + " ms");
+
         // emoji colorido: tem pixels de cor?
         Stopwatch sw = Stopwatch.StartNew();
         Bitmap teste = EmojiCor.Criar("\U0001F600", 40, 27f);
@@ -148,7 +178,9 @@ static class Teste
         j.Location = new Point(-3000, -3000);
         Foto(j, saida, "emotes");
         sw.Restart(); j.MostrarPagina(Janela.PgConfig); Console.WriteLine("abrir config: " + sw.ElapsedMilliseconds + " ms");
+        j.Height = 880;
         Foto(j, saida, "config");
+        j.Height = 580;
         sw.Restart(); j.MostrarPagina(Janela.PgHistorico); Console.WriteLine("abrir historico: " + sw.ElapsedMilliseconds + " ms");
         Foto(j, saida, "historico");
         Console.WriteLine("estado: disposed="+j.IsDisposed+" visible="+j.Visible+" pagina="+j.Pagina+" itens="+Historico.Itens.Count);
