@@ -422,6 +422,161 @@ static class Teste
         Ok(Config.Atalhos.Length == Config.NomesAcoes.Length, "todo atalho tem nome");
     }
 
+    // ---- Salvos com imagem ----
+    static object Chamar(object o, string metodo, params object[] args)
+    {
+        return o.GetType().GetMethod(metodo, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public).Invoke(o, args);
+    }
+
+    static void TestarSalvos(string saida, Nucleo nuc)
+    {
+        string pasta = Path.Combine(saida, "salvos-teste");
+        if (Directory.Exists(pasta)) Directory.Delete(pasta, true);
+        Salvos.PastaTeste = pasta;
+        Salvos.Esquecer();
+
+        Salvo so = Salvos.Adicionar("So texto, como sempre foi");
+        Salvo ambos;
+        using (Bitmap b = Listras(400, 300)) ambos = Salvos.Adicionar("Oferta de hoje\nChame no privado", b);
+        Salvo soImg;
+        using (Bitmap b = Listras(200, 200)) soImg = Salvos.Adicionar("", b);
+
+        Ok(!so.TemImagem && ambos.TemImagem && ambos.TemTexto && soImg.TemImagem && !soImg.TemTexto, "tipos de salvo");
+        Ok(File.Exists(Path.ChangeExtension(ambos.Caminho, ".png")), "imagem fica ao lado do texto");
+        Ok(soImg.Titulo == "Imagem salva", "titulo do salvo so com imagem");
+        Ok(ambos.Foto.Mini != null, "miniatura do salvo");
+
+        // sobrevive a reabrir o programa
+        Salvos.Esquecer();
+        Ok(Salvos.Itens.Count == 3, "salvos voltam do disco");
+        Salvo volta = null;
+        foreach (Salvo s in Salvos.Itens) if (s.Texto.StartsWith("Oferta")) volta = s;
+        Ok(volta != null && volta.TemImagem && volta.Foto.Info == "400 x 300", "imagem volta com o salvo");
+        ambos = volta;
+
+        // a imagem do salvo nao entra no historico nem vence
+        Ok(!Historico.EhDoHistorico(Path.Combine(Config.Pasta, "x.png")) || !Path.GetDirectoryName(ambos.Caminho).Equals(Config.Pasta), "salvo fora da pasta do historico");
+
+        // Tela de verdade
+        Janela j = new Janela(nuc, Janela.PgSalvos);
+        j.Location = new Point(-6000, 0);
+        j.Show();
+        Application.DoEvents();
+        ListaCartoes lista = AcharLista(j);
+        Ok(lista != null && lista.Items.Count == 3, "lista mostra os salvos");
+        int ind = -1;
+        for (int i = 0; i < lista.Items.Count; i++) if (((List<Salvo>)CampoJ(j, "visSalvos"))[i] == ambos) ind = i;
+        lista.SelectedIndex = ind;
+        Application.DoEvents();
+        Foto(j, saida, "salvos");
+        PictureBox pv = (PictureBox)CampoJ(j, "previaSalvo");
+        Ok(pv.Visible && pv.Image != null, "previa mostra a imagem");
+
+        // editar: cancelar nao muda nada
+        Chamar(j, "ComecarEdicao", ambos);
+        Chamar(j, "TirarImagemSalvo");
+        Ok(!pv.Visible, "tirar imagem some da previa");
+        Chamar(j, "CancelarEdicao");
+        Ok(ambos.TemImagem && File.Exists(ambos.Foto.Caminho), "cancelar mantem a imagem");
+        Ok(pv.Visible, "cancelar volta a previa");
+
+        Chamar(j, "ComecarEdicao", ambos);
+        Chamar(j, "AnexarImagem", Listras(120, 90));
+        Application.DoEvents();
+        Foto(j, saida, "salvos-editando");
+        Chamar(j, "CancelarEdicao");
+        Ok(ambos.Foto.Info == "400 x 300", "cancelar nao troca a imagem");
+
+        // editar: trocar de verdade
+        Chamar(j, "ComecarEdicao", ambos);
+        Chamar(j, "AnexarImagem", Listras(120, 90));
+        Chamar(j, "SalvarEdicao");
+        Ok(ambos.Foto.Info == "120 x 90", "salvar troca a imagem");
+
+        // novo salvo com imagem pela tela
+        Chamar(j, "ComecarEdicao", new object[] { null });
+        ((TextBoxBase)CampoJ(j, "editor")).Text = "Salvo novo pela tela";
+        Chamar(j, "AnexarImagem", Listras(64, 64));
+        Chamar(j, "SalvarEdicao");
+        Salvo novoTela = Salvos.Itens[0];
+        Ok(novoTela.Texto == "Salvo novo pela tela" && novoTela.TemImagem, "novo salvo com imagem");
+
+        // tirar a imagem e tirar o texto de um so com imagem
+        Chamar(j, "ComecarEdicao", novoTela);
+        Chamar(j, "TirarImagemSalvo");
+        Chamar(j, "SalvarEdicao");
+        Ok(!novoTela.TemImagem && !File.Exists(Path.ChangeExtension(novoTela.Caminho, ".png")), "tirar imagem apaga o arquivo");
+
+        // Envio escolhe o tipo certo
+        object e1 = typeof(Janela).GetMethod("Envio", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic).Invoke(null, new object[] { ambos });
+        object e2 = typeof(Janela).GetMethod("Envio", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic).Invoke(null, new object[] { so });
+        object e3 = typeof(Janela).GetMethod("Envio", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic).Invoke(null, new object[] { soImg });
+        Ok(e1 is EnvioSalvo && ((EnvioSalvo)e1).ComTexto, "salvo completo envia os dois");
+        Ok(e2 is string, "salvo so de texto continua igual");
+        Ok(e3 is EnvioSalvo && !((EnvioSalvo)e3).ComTexto, "salvo so de imagem envia a imagem");
+        j.Dispose();
+
+        // apagar leva a imagem junto
+        string pngAmbos = ambos.Foto.Caminho;
+        Salvos.Remover(ambos);
+        Ok(!File.Exists(pngAmbos) && !File.Exists(ambos.Caminho), "apagar remove texto e imagem");
+
+        // Colagem real em duas etapas, numa janela que aceita imagem e texto
+        string guardado = Clipboard.ContainsText() ? Clipboard.GetText() : null;
+        Form alvo = new Form();
+        alvo.Text = "alvo";
+        alvo.Size = new Size(500, 300);
+        alvo.StartPosition = FormStartPosition.Manual;
+        alvo.Location = new Point(100, 100);
+        RichTextBox rt = new RichTextBox();
+        rt.Dock = DockStyle.Fill;
+        alvo.Controls.Add(rt);
+        alvo.Show();
+        alvo.Activate();
+        Nativo.SetForegroundWindow(alvo.Handle);
+        rt.Focus();
+        Application.DoEvents();
+        bool emFoco = Nativo.GetForegroundWindow() == alvo.Handle;
+        Console.WriteLine("janela alvo em foco: " + emFoco);
+
+        using (Bitmap b = Listras(40, 40)) App.PorImagem(b);
+        SendKeys.SendWait("^v");
+        Application.DoEvents();
+        bool terminou = false;
+        App.ColarLegenda("LEGENDA-DE-TESTE", alvo.Handle, 200, delegate { terminou = true; });
+        Stopwatch espera = Stopwatch.StartNew();
+        while (!terminou && espera.ElapsedMilliseconds < 3000) { Application.DoEvents(); System.Threading.Thread.Sleep(10); }
+        Application.DoEvents();
+        Ok(terminou, "legenda foi colada no tempo");
+        if (emFoco)
+        {
+            Ok(rt.Rtf.Contains("\\pict") || rt.Rtf.Contains("\\object"), "imagem entrou na janela");
+            Ok(rt.Text.Contains("LEGENDA-DE-TESTE"), "texto entrou depois da imagem");
+            Ok(rt.Text.IndexOf("LEGENDA") == rt.Text.LastIndexOf("LEGENDA"), "texto entrou uma vez so");
+        }
+        Ok(Clipboard.ContainsText() && Clipboard.GetText() == "LEGENDA-DE-TESTE", "texto fica na area de transferencia");
+
+        // mudou de janela: nao cola
+        rt.Clear();
+        terminou = false;
+        App.ColarLegenda("NAO-PODE-COLAR", new IntPtr(1), 50, delegate { terminou = true; });
+        espera.Restart();
+        while (!terminou && espera.ElapsedMilliseconds < 3000) { Application.DoEvents(); System.Threading.Thread.Sleep(10); }
+        Application.DoEvents();
+        Ok(!rt.Text.Contains("NAO-PODE-COLAR"), "outra janela na frente: nao cola");
+        Ok(Clipboard.GetText() == "NAO-PODE-COLAR", "mas o texto fica copiado");
+
+        alvo.Dispose();
+        if (guardado != null) Clipboard.SetText(guardado); else Clipboard.Clear();
+        Salvos.PastaTeste = null;
+        Salvos.Esquecer();
+    }
+
+    static object CampoJ(Janela j, string nome)
+    {
+        return typeof(Janela).GetField(nome, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic).GetValue(j);
+    }
+
     public static void Rodar(string[] args)
     {
         string saida = args[0];
@@ -579,6 +734,7 @@ static class Teste
             Ok(j.IsDisposed || !j.Visible, "dois cliques fecham");
         }
         j.Dispose();
+        TestarSalvos(saida, nuc);
         nuc.Dispose();
         Console.WriteLine("janela fechou e soltou o Direct2D");
 

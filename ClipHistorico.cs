@@ -747,13 +747,32 @@ class Salvo
     public string   Texto;
     public string   Titulo;
     public DateTime Hora;
+    public Item     Foto;      // imagem do salvo, ou null
+
+    public bool TemImagem { get { return Foto != null; } }
+    public bool TemTexto  { get { return Texto.Trim().Length > 0; } }
+}
+
+// O que vai ser entregue de um salvo que tem imagem. Nao e um Item do historico
+// de proposito: la dentro a imagem entraria no prazo e seria apagada.
+class EnvioSalvo
+{
+    public readonly Salvo Salvo;
+    public readonly bool  ComTexto;
+    public EnvioSalvo(Salvo salvo, bool comTexto) { Salvo = salvo; ComTexto = comTexto; }
 }
 
 static class Salvos
 {
     static List<Salvo> itens;   // carregado so quando a aba e aberta
 
+#if TESTE
+    public static string PastaTeste;
+    public static void Esquecer() { itens = null; }
+    static string Pasta { get { return PastaTeste ?? Path.Combine(Config.PastaDados, "salvos"); } }
+#else
     static string Pasta { get { return Path.Combine(Config.PastaDados, "salvos"); } }
+#endif
 
     public static List<Salvo> Itens
     {
@@ -779,12 +798,21 @@ static class Salvos
         Salvo s = new Salvo();
         s.Caminho = caminho;
         s.Texto   = texto;
-        s.Titulo  = Tema.TituloDe(texto);
         s.Hora    = Item.HoraDoNome(caminho);
+        string png = CaminhoImagem(s);
+        if (File.Exists(png)) s.Foto = Item.DeArquivo(png);
+        s.Titulo  = TituloDe(s);
         return s;
     }
 
-    public static Salvo Adicionar(string texto)
+    static string CaminhoImagem(Salvo s) { return Path.ChangeExtension(s.Caminho, ".png"); }
+
+    static string TituloDe(Salvo s) { return s.TemTexto ? Tema.TituloDe(s.Texto) : "Imagem salva"; }
+
+    public static Salvo Adicionar(string texto) { return Adicionar(texto, null); }
+
+    // A imagem fica ao lado do texto, com o mesmo nome. Sem texto, salva so a imagem.
+    public static Salvo Adicionar(string texto, Image imagem)
     {
         Directory.CreateDirectory(Pasta);
         DateTime agora = DateTime.Now;
@@ -795,22 +823,39 @@ static class Salvos
             agora = agora.AddMilliseconds(1);
         } while (File.Exists(p));
 
+        if (imagem != null) Historico.Gravar(imagem, Path.ChangeExtension(p, ".png"));
         File.WriteAllText(p, texto, new UTF8Encoding(true));
         Salvo s = Criar(p, texto);
         Itens.Insert(0, s);
         return s;
     }
 
+    // imagem = null tira a imagem do salvo
+    public static void DefinirImagem(Salvo s, Image imagem)
+    {
+        string png = CaminhoImagem(s);
+        if (s.Foto != null) { s.Foto.LiberarMini(); s.Foto = null; }
+        if (imagem == null) File.Delete(png);
+        else
+        {
+            Historico.Gravar(imagem, png);
+            s.Foto = Item.DeArquivo(png);
+        }
+        s.Titulo = TituloDe(s);
+    }
+
     public static void Alterar(Salvo s, string texto)
     {
         File.WriteAllText(s.Caminho, texto, new UTF8Encoding(true));
         s.Texto  = texto;
-        s.Titulo = Tema.TituloDe(texto);
+        s.Titulo = TituloDe(s);
     }
 
     public static void Remover(Salvo s)
     {
         try { File.Delete(s.Caminho); } catch { }
+        try { File.Delete(CaminhoImagem(s)); } catch { }
+        if (s.Foto != null) s.Foto.LiberarMini();
         Itens.Remove(s);
     }
 }
@@ -2167,6 +2212,10 @@ class Janela : Form
 
     // Salvos
     ListaCartoes listaSalvos;
+    PictureBox previaSalvo;
+    Label botaoTirarImagem;
+    Bitmap imagemNova;           // imagem escolhida na edicao, ainda nao salva
+    bool imagemTirada;
     Label vazioSalvos, infoSalvos;
     TextBox editor;
     Panel barraEdicao;
@@ -2435,7 +2484,7 @@ class Janela : Form
         botaoConfig.ForeColor = p == PgConfig ? Tema.Destaque : Tema.Suave;
         barraBusca.Visible = p != PgConfig;
         botaoAcao.Visible = p == PgHistorico || p == PgSalvos;
-        botaoAcao.Text = p == PgSalvos ? "+  Novo texto" : "Limpar tudo";
+        botaoAcao.Text = p == PgSalvos ? "+  Novo salvo" : "Limpar tudo";
 
         switch (p)
         {
@@ -2600,9 +2649,19 @@ class Janela : Form
         salvar.Click += delegate
         {
             Item it = ItemHistAtual();
-            if (it == null || it.Imagem) return;
-            Salvos.Adicionar(it.Texto);
-            infoHist.Text = "\u2713  Salvo na aba Salvos";
+            if (it == null) return;
+            try
+            {
+                if (!it.Imagem) Salvos.Adicionar(it.Texto);
+                else using (Bitmap img = Historico.LerImagem(it.Caminho)) Salvos.Adicionar("", img);
+                infoHist.Text = it.Imagem ? "\u2713  Salva. Edite na aba Salvos para colocar o texto"
+                                          : "\u2713  Salvo na aba Salvos";
+            }
+            catch (Exception ex)
+            {
+                App.Log("Erro ao salvar item: " + ex.Message);
+                infoHist.Text = "N\u00e3o consegui salvar.";
+            }
         };
         apagar.Click += delegate { ApagarHistorico(); };
         m.Items.AddRange(new ToolStripItem[] { copiar, editar, salvar, salvarArquivo, new ToolStripSeparator(), apagar });
@@ -2610,7 +2669,6 @@ class Janela : Form
         {
             Item it = ItemHistAtual();
             if (it == null) { e.Cancel = true; return; }
-            salvar.Visible = !it.Imagem;
             salvarArquivo.Visible = it.Imagem;
             editar.Visible = it.Imagem;
         };
@@ -2785,9 +2843,14 @@ class Janela : Form
         {
             Salvo s = visSalvos[i];
             c.Titulo = s.Titulo;
-            c.Info = s.Texto.Length + " caracteres";
-            c.Icone = "\u2605";
-            c.FonteIcone = Tema.Engrenagem;
+            c.Info = !s.TemImagem ? s.Texto.Length + " caracteres" :
+                     s.TemTexto ? "Imagem + " + s.Texto.Length + " caracteres" : "S\u00f3 imagem";
+            if (s.TemImagem) c.Mini = s.Foto.Mini;
+            if (c.Mini == null)
+            {
+                c.Icone = "\u2605";
+                c.FonteIcone = Tema.Engrenagem;
+            }
         };
         listaSalvos.SelectedIndexChanged += delegate { if (!editando) PreviaSalvo(); };
         listaSalvos.MouseDoubleClick += delegate(object s, MouseEventArgs e)
@@ -2797,7 +2860,7 @@ class Janela : Form
             if (i < 0 || i >= visSalvos.Count) return;
             Salvo alvo = visSalvos[i];   // a edicao pode mudar a ordem da lista
             if (editando) SalvarEdicao();
-            Escolher(alvo.Texto);
+            Escolher(Envio(alvo));
         };
         listaSalvos.KeyPress += RedirecionarDigitacao;
         listaSalvos.ContextMenuStrip = MenuSalvos();
@@ -2834,10 +2897,30 @@ class Janela : Form
         cancelar.Dock = DockStyle.Left;
         cancelar.Width = 110;
         cancelar.MouseDown += delegate { CancelarEdicao(); };
-        barraEdicao.Controls.AddRange(new Control[] { cancelar, vao, salvar });
+        Panel vao2 = NovoPainel(DockStyle.Left, Tema.Painel);
+        vao2.Width = 8;
+        Label imagem = BotaoCheio("Imagem", Tema.Campo, Tema.CampoSob);
+        imagem.Dock = DockStyle.Left;
+        imagem.Width = 110;
+        imagem.MouseDown += delegate { MenuImagemSalvo(imagem); };
+        dicas.SetToolTip(imagem, "Colocar uma imagem junto com o texto. Ctrl+V cola uma imagem copiada");
+        Panel vao3 = NovoPainel(DockStyle.Left, Tema.Painel);
+        vao3.Width = 8;
+        botaoTirarImagem = BotaoCheio("Tirar imagem", Tema.Campo, Tema.CampoSob);
+        botaoTirarImagem.Dock = DockStyle.Left;
+        botaoTirarImagem.Width = 110;
+        botaoTirarImagem.MouseDown += delegate { TirarImagemSalvo(); };
+        barraEdicao.Controls.AddRange(new Control[] { botaoTirarImagem, vao3, imagem, vao2, cancelar, vao, salvar });
         barraEdicao.Visible = false;
 
-        direita.Controls.AddRange(new Control[] { editor, barraEdicao, infoSalvos });
+        previaSalvo = new PictureBox();
+        previaSalvo.Dock = DockStyle.Top;
+        previaSalvo.Height = 210;
+        previaSalvo.SizeMode = PictureBoxSizeMode.Zoom;
+        previaSalvo.BackColor = Tema.Painel;
+        previaSalvo.Visible = false;
+
+        direita.Controls.AddRange(new Control[] { editor, barraEdicao, previaSalvo, infoSalvos });
         pg.Controls.AddRange(new Control[] { direita, espaco, esquerda });
         return pg;
     }
@@ -2846,18 +2929,28 @@ class Janela : Form
     {
         ContextMenuStrip m = CoresMenu.NovoMenu();
         ToolStripMenuItem copiar = new ToolStripMenuItem("Copiar");
+        ToolStripMenuItem soTexto = new ToolStripMenuItem("Copiar s\u00f3 o texto");
+        ToolStripMenuItem soImagem = new ToolStripMenuItem("Copiar s\u00f3 a imagem");
         ToolStripMenuItem editar = new ToolStripMenuItem("Editar");
         ToolStripMenuItem apagar = new ToolStripMenuItem("Apagar");
-        copiar.Click += delegate { Salvo s = SalvoAtual(); if (s != null) Escolher(s.Texto); };
+        copiar.Click += delegate { Salvo s = SalvoAtual(); if (s != null) Escolher(Envio(s)); };
+        soTexto.Click += delegate { Salvo s = SalvoAtual(); if (s != null) Escolher(s.Texto); };
+        soImagem.Click += delegate { Salvo s = SalvoAtual(); if (s != null) Escolher(new EnvioSalvo(s, false)); };
         editar.Click += delegate { Salvo s = SalvoAtual(); if (s != null) ComecarEdicao(s); };
         apagar.Click += delegate { ApagarSalvo(); };
-        m.Items.AddRange(new ToolStripItem[] { copiar, editar, new ToolStripSeparator(), apagar });
+        m.Items.AddRange(new ToolStripItem[] { copiar, soTexto, soImagem, editar, new ToolStripSeparator(), apagar });
         m.Opening += delegate(object s, System.ComponentModel.CancelEventArgs e)
         {
-            if (SalvoAtual() == null) e.Cancel = true;
+            Salvo atual = SalvoAtual();
+            if (atual == null) { e.Cancel = true; return; }
+            soTexto.Visible = soImagem.Visible = atual.TemImagem && atual.TemTexto;
+            copiar.Text = atual.TemImagem && atual.TemTexto ? "Colar imagem e texto" : "Copiar";
         };
         return m;
     }
+
+    // Salvo com imagem entrega os dois de uma vez; so com texto, segue como sempre
+    static object Envio(Salvo s) { return s.TemImagem ? (object)new EnvioSalvo(s, s.TemTexto) : s.Texto; }
 
     Salvo SalvoAtual()
     {
@@ -2876,7 +2969,7 @@ class Janela : Form
         bool tem = visSalvos.Count > 0;
         listaSalvos.Visible = tem;
         vazioSalvos.Visible = !tem;
-        vazioSalvos.Text = filtro.Length > 0 ? "Nenhum resultado" : "Nenhum texto salvo ainda.\nClique em \"+ Novo texto\" no topo.";
+        vazioSalvos.Text = filtro.Length > 0 ? "Nenhum resultado" : "Nada salvo ainda.\nClique em \"+ Novo salvo\" no topo.";
 
         if (tem) listaSalvos.SelectedIndex = 0;
         else if (!editando) PreviaSalvo();
@@ -2886,8 +2979,88 @@ class Janela : Form
     {
         Salvo s = SalvoAtual();
         editor.Text = s == null ? "" : Quebras(s.Texto);
+        Bitmap b = null;
+        if (s != null && s.TemImagem)
+            try { b = Historico.LerPrevia(s.Foto.Caminho, 520, 210); }
+            catch (Exception ex) { App.Log("Erro ao abrir imagem do salvo: " + ex.Message); }
+        TrocarPreviaSalvo(b);
         infoSalvos.Text = s == null ? "" :
-            "TEXTO SALVO" + Tema.Ponto + s.Texto.Length + " caracteres" + Tema.Ponto + "bot\u00e3o direito para editar";
+            !s.TemImagem ? "TEXTO SALVO" + Tema.Ponto + s.Texto.Length + " caracteres" + Tema.Ponto + "bot\u00e3o direito para editar" :
+            s.TemTexto ? "IMAGEM E TEXTO" + Tema.Ponto + "duplo clique cola os dois" + Tema.Ponto + "bot\u00e3o direito para editar" :
+            "IMAGEM SALVA" + Tema.Ponto + "bot\u00e3o direito para editar";
+    }
+
+    void TrocarPreviaSalvo(Bitmap nova)
+    {
+        Image velha = previaSalvo.Image;
+        previaSalvo.Image = nova;
+        previaSalvo.Visible = nova != null;
+        if (velha != null) velha.Dispose();
+    }
+
+    void MenuImagemSalvo(Control perto)
+    {
+        ContextMenuStrip m = CoresMenu.NovoMenu();
+        ToolStripMenuItem arquivo = new ToolStripMenuItem("Escolher arquivo...");
+        arquivo.Click += delegate { ImagemSalvoDeArquivo(); };
+        ToolStripMenuItem colar = new ToolStripMenuItem("Colar imagem copiada (Ctrl+V)");
+        colar.Click += delegate { ColarImagemSalvo(); };
+        colar.Enabled = Clipboard.ContainsImage();
+        m.Items.AddRange(new ToolStripItem[] { arquivo, colar });
+        m.Closed += delegate { BeginInvoke(new MethodInvoker(m.Dispose)); };
+        m.Show(perto, new Point(0, 0), ToolStripDropDownDirection.AboveRight);
+    }
+
+    void ImagemSalvoDeArquivo()
+    {
+        dialogoAberto = true;
+        try
+        {
+            using (OpenFileDialog d = new OpenFileDialog())
+            {
+                d.Title = "Escolher imagem";
+                d.Filter = "Imagens|*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp|Todos os arquivos|*.*";
+                if (d.ShowDialog(this) != DialogResult.OK) return;
+                try { AnexarImagem(Historico.LerImagem(d.FileName)); }
+                catch (Exception ex)
+                {
+                    App.Log("Erro ao abrir imagem para o salvo: " + ex.Message);
+                    infoSalvos.Text = "N\u00e3o consegui abrir essa imagem.";
+                }
+            }
+        }
+        finally { dialogoAberto = false; }
+    }
+
+    void ColarImagemSalvo()
+    {
+        try
+        {
+            Image img = Clipboard.ContainsImage() ? Clipboard.GetImage() : null;
+            if (img == null) return;
+            AnexarImagem(img as Bitmap ?? new Bitmap(img));
+        }
+        catch (Exception ex) { App.Log("Erro ao colar imagem no salvo: " + ex.Message); }
+    }
+
+    // A imagem so vai para o disco ao salvar: Cancelar nao muda nada
+    void AnexarImagem(Bitmap img)
+    {
+        if (!editando) { img.Dispose(); return; }
+        if (imagemNova != null) imagemNova.Dispose();
+        imagemNova = img;
+        imagemTirada = false;
+        TrocarPreviaSalvo(new Bitmap(img));
+        botaoTirarImagem.Visible = true;
+    }
+
+    void TirarImagemSalvo()
+    {
+        if (!editando) return;
+        if (imagemNova != null) { imagemNova.Dispose(); imagemNova = null; }
+        imagemTirada = true;
+        TrocarPreviaSalvo(null);
+        botaoTirarImagem.Visible = false;
     }
 
     void ComecarEdicao(Salvo s)
@@ -2898,7 +3071,10 @@ class Janela : Form
         editor.ReadOnly = false;
         editor.BackColor = Tema.Campo;
         editor.Text = s == null ? "" : Quebras(s.Texto);
-        infoSalvos.Text = s == null ? "NOVO TEXTO" + Tema.Ponto + "escreva e clique em Salvar (Ctrl+S)"
+        imagemTirada = false;
+        if (s == null) TrocarPreviaSalvo(null);
+        botaoTirarImagem.Visible = s != null && s.TemImagem;
+        infoSalvos.Text = s == null ? "NOVO SALVO" + Tema.Ponto + "escreva, coloque uma imagem se quiser e clique em Salvar (Ctrl+S)"
                                     : "EDITANDO" + Tema.Ponto + "Ctrl+S salva" + Tema.Ponto + "Esc cancela";
         barraEdicao.Visible = true;
         editor.Focus();
@@ -2910,16 +3086,37 @@ class Janela : Form
         if (!editando) return;
         string t = editor.Text;
         Salvo alvo = emEdicao;
+        Bitmap nova = imagemNova;
+        bool tirar = imagemTirada;
+        imagemNova = null;
         SairDaEdicao();
 
-        if (t.Trim().Length > 0)
+        bool teraImagem = nova != null || (alvo != null && alvo.TemImagem && !tirar);
+        string erro = null;
+        if (t.Trim().Length > 0 || teraImagem)
         {
-            if (alvo == null) alvo = Salvos.Adicionar(t);
-            else Salvos.Alterar(alvo, t);
+            try
+            {
+                if (alvo == null) alvo = Salvos.Adicionar(t, nova);
+                else
+                {
+                    Salvos.Alterar(alvo, t);
+                    if (nova != null) Salvos.DefinirImagem(alvo, nova);
+                    else if (tirar) Salvos.DefinirImagem(alvo, null);
+                }
+            }
+            catch (Exception ex)
+            {
+                App.Log("Erro ao salvar: " + ex.Message);
+                erro = "N\u00e3o consegui salvar: " + ex.Message;
+            }
         }
+        if (nova != null) nova.Dispose();
         RecarregarSalvos();
         int i = alvo == null ? -1 : visSalvos.IndexOf(alvo);
         if (i >= 0) listaSalvos.SelectedIndex = i;
+        PreviaSalvo();
+        if (erro != null) infoSalvos.Text = erro;
     }
 
     void CancelarEdicao()
@@ -2936,6 +3133,8 @@ class Janela : Form
         editor.ReadOnly = true;
         editor.BackColor = Tema.Painel;
         barraEdicao.Visible = false;
+        if (imagemNova != null) { imagemNova.Dispose(); imagemNova = null; }
+        imagemTirada = false;
     }
 
     void ApagarSalvo()
@@ -3279,6 +3478,12 @@ class Janela : Form
         if (pagina == PgHistorico || pagina == PgSalvos)
         {
             ListaCartoes l = pagina == PgHistorico ? listaHist : listaSalvos;
+            if (pagina == PgSalvos && editando && k == (Keys.Control | Keys.V) &&
+                Clipboard.ContainsImage() && !Clipboard.ContainsText())
+            {
+                ColarImagemSalvo();
+                return true;
+            }
             AplicarBuscaPendente(k);
             switch (k)
             {
@@ -3290,7 +3495,7 @@ class Janela : Form
                     return true;
                 case Keys.Enter:
                     if (pagina == PgHistorico) { Item it = ItemHistAtual(); if (it != null) Escolher(it); }
-                    else { Salvo s = SalvoAtual(); if (s != null) Escolher(s.Texto); }
+                    else { Salvo s = SalvoAtual(); if (s != null) Escolher(Envio(s)); }
                     return true;
                 case Keys.Down:
                     if (l.SelectedIndex < l.Items.Count - 1) l.SelectedIndex++;
@@ -5101,27 +5306,13 @@ class App : ApplicationContext
         catch (Exception ex) { Log("Erro ao abrir o editor: " + ex.ToString()); }
     }
 
-    // Vai como bitmap sobre branco, que todo programa cola, e tambem como PNG,
-    // para quem aceita transparencia. Se mudou, entra no historico como imagem
-    // nova: a original continua la.
+    // Se mudou, entra no historico como imagem nova: a original continua la.
     public static bool CopiarEdicao(Bitmap img, bool alterada)
     {
         try
         {
-            using (Bitmap plano = Historico.SemTransparencia(img))
-            using (MemoryStream png = new MemoryStream())
-            {
-                img.Save(png, ImageFormat.Png);
-                DataObject d = new DataObject();
-                d.SetImage(plano);
-                d.SetData("PNG", false, png);
-                Clipboard.SetDataObject(d, true, 10, 100);
-            }
-            if (instancia != null)
-            {
-                instancia.ultimaSeq = Nativo.GetClipboardSequenceNumber();
-                if (alterada) instancia.GuardarImagem(new Bitmap(img), null);
-            }
+            PorImagem(img);
+            if (alterada && instancia != null) instancia.GuardarImagem(new Bitmap(img), null);
             return true;
         }
         catch (Exception ex)
@@ -5166,6 +5357,9 @@ class App : ApplicationContext
     // Coloca o item escolhido na area de transferencia
     void Usar(object resultado)
     {
+        EnvioSalvo envio = resultado as EnvioSalvo;
+        if (envio != null) { UsarSalvo(envio); return; }
+
         Item item = resultado as Item;
         try
         {
@@ -5198,6 +5392,68 @@ class App : ApplicationContext
             System.Threading.Thread.Sleep(120);
             SendKeys.SendWait("^v");
         }
+    }
+
+    // Imagem e texto nao viajam juntos no Ctrl+V: quem cola fica com um so.
+    // Entao cola a imagem e, com a previa do WhatsApp aberta, cola o texto na
+    // legenda. Nunca aperta Enter: quem confere e envia e a pessoa.
+    void UsarSalvo(EnvioSalvo e)
+    {
+        try
+        {
+            using (Bitmap img = Historico.LerImagem(e.Salvo.Foto.Caminho)) PorImagem(img);
+        }
+        catch (Exception ex)
+        {
+            Log("Erro ao copiar imagem do salvo: " + ex.Message);
+            return;
+        }
+
+        if (anterior != IntPtr.Zero) Nativo.SetForegroundWindow(anterior);
+        if (!e.ComTexto && !Config.ColarAuto) return;
+        System.Threading.Thread.Sleep(120);
+        SendKeys.SendWait("^v");
+        if (e.ComTexto) ColarLegenda(e.Salvo.Texto, anterior, EsperaLegenda, null);
+    }
+
+    const int EsperaLegenda = 1200;   // tempo da previa da imagem abrir
+
+    // Se a pessoa mudou de janela enquanto esperava, o texto fica so copiado:
+    // nao vai parar em outra conversa ou programa.
+    public static void ColarLegenda(string texto, IntPtr janelaAlvo, int ms, Action fim)
+    {
+        Timer t = new Timer();
+        t.Interval = ms;
+        t.Tick += delegate
+        {
+            t.Stop();
+            t.Dispose();
+            try
+            {
+                Clipboard.SetDataObject(texto, true, 10, 100);
+                if (instancia != null) instancia.ultimaSeq = Nativo.GetClipboardSequenceNumber();
+                if (Nativo.GetForegroundWindow() == janelaAlvo) SendKeys.SendWait("^v");
+            }
+            catch (Exception ex) { Log("Erro ao colar a legenda: " + ex.Message); }
+            if (fim != null) fim();
+        };
+        t.Start();
+    }
+
+    // Vai como bitmap sobre branco, que todo programa cola, e tambem como PNG,
+    // para quem aceita transparencia. Nao entra de novo no historico.
+    public static void PorImagem(Image img)
+    {
+        using (Bitmap plano = Historico.SemTransparencia(img))
+        using (MemoryStream png = new MemoryStream())
+        {
+            img.Save(png, ImageFormat.Png);
+            DataObject d = new DataObject();
+            d.SetImage(plano);
+            d.SetData("PNG", false, png);
+            Clipboard.SetDataObject(d, true, 10, 100);
+        }
+        if (instancia != null) instancia.ultimaSeq = Nativo.GetClipboardSequenceNumber();
     }
 
     // ---- Iniciar com o Windows ----

@@ -5,7 +5,7 @@
 ## O que faz
 
 - **Histórico:** guarda até 50 textos e 10 imagens copiados, com busca e prévia. Apaga sozinho depois do prazo que você escolher (1 hora a 30 dias, ou nunca; padrão de 1 dia).
-- **Salvos:** textos fixos para colar quando quiser.
+- **Salvos:** textos e imagens fixos. Um salvo pode ter imagem e texto juntos: o duplo clique cola a imagem e, com a prévia do WhatsApp aberta, cola o texto na legenda. Nunca aperta Enter, e salvos não têm prazo.
 - **Emotes coloridos:** 1.715 emojis com busca em português.
 - **Prints:** janela ativa ou tela inteira, inclusive em jogos. Vão para `Imagens\PRINTS` e para a área de transferência.
 - **Recorte de tela:** `Win + Shift + S` congela a tela (todos os monitores), você arrasta a área e ela vai para a área de transferência e para o histórico. Funciona em cima de jogos e programas em tela cheia.
