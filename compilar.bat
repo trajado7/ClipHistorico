@@ -20,6 +20,10 @@ if not exist "emojis.gz" (
     exit /b 1
 )
 
+rem Fecha o programa: aberto, ele trava o .exe e a compilacao falha
+taskkill /IM ClipHistorico.exe /F >nul 2>&1
+timeout /t 1 /nobreak >nul
+
 rem x86 = versao 32 bits, que usa menos memoria
 "%CSC%" /nologo /target:winexe /platform:x86 /optimize+ /debug- %ICONE% /resource:emojis.gz,emojis.gz /out:ClipHistorico.exe /r:System.Windows.Forms.dll /r:System.Drawing.dll ClipHistorico.cs
 
@@ -30,7 +34,8 @@ if errorlevel 1 (
     exit /b 1
 )
 
+start "" "%~dp0ClipHistorico.exe"
+
 echo.
-echo Pronto! ClipHistorico.exe foi criado nesta pasta.
-echo Pode abrir ele com dois cliques.
+echo Pronto! O ClipHistorico foi atualizado e ja esta aberto.
 pause

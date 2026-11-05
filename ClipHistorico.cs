@@ -3,7 +3,7 @@
 //  Area de transferencia turbinada para Windows
 //
 //  Abas: Historico (textos e imagens copiados), Salvos (seus textos fixos)
-//  e Emotes (com busca em portugues, como o Win + . do Windows).
+//  e Emotes coloridos (com busca em portugues, como o Win + . do Windows).
 //
 //  Atalhos padrao (mude na engrenagem da janela):
 //    Win + V ............ historico
@@ -27,9 +27,10 @@ using System.IO.Compression;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
-using System.Text.RegularExpressions;
+using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
+using Timer = System.Windows.Forms.Timer;
 
 
 // ---------------------------------------------------------------------
@@ -218,6 +219,14 @@ static class Nativo
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr GetModuleHandle(string name);
     [DllImport("kernel32.dll")] public static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+    [DllImport("kernel32.dll", EntryPoint = "RtlMoveMemory")] public static extern void CopiarMemoria(IntPtr destino, IntPtr origem, IntPtr bytes);
+
+    // Laco de mensagens proprio do gancho de teclado
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MSG { public IntPtr hwnd; public uint message; public IntPtr wParam, lParam; public uint time; public int x, y; }
+    [DllImport("user32.dll")] public static extern int GetMessage(out MSG msg, IntPtr hWnd, uint min, uint max);
+    [DllImport("user32.dll")] public static extern bool PostThreadMessage(uint thread, int msg, IntPtr wParam, IntPtr lParam);
     [DllImport("psapi.dll")] public static extern bool EmptyWorkingSet(IntPtr hProcess);
 
     // Usados pelo print
@@ -264,9 +273,8 @@ static class Tema
     public static readonly Font Icone    = new Font("Segoe UI Semibold", 11f);
     public static readonly Font Simbolo  = new Font("Marlett", 9f);
     public static readonly Font Engrenagem = new Font("Segoe UI Symbol", 13f);
-    public static readonly Font Emote    = new Font("Segoe UI Emoji", 17f);
-    public static readonly Font EmoteMeio = new Font("Segoe UI Emoji", 13f);
-    public static readonly Font EmoteGrande = new Font("Segoe UI Emoji", 20f);
+    static Font emote;
+    public static Font Emote { get { return emote ?? (emote = new Font("Segoe UI Emoji", 17f)); } }
 
     public const TextFormatFlags Linha = TextFormatFlags.Left | TextFormatFlags.VerticalCenter |
         TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix;
@@ -324,8 +332,16 @@ static class Tema
             while ((l = r.ReadLine()) != null)
                 if (l.Trim().Length > 0) { linha = l; break; }
         }
-        linha = Regex.Replace(linha.Trim(), @"\s+", " ");
-        return linha.Length > 200 ? linha.Substring(0, 200) : linha;
+        StringBuilder sb = new StringBuilder(Math.Min(linha.Length, 200));
+        bool espaco = false;
+        foreach (char c in linha.Trim())
+        {
+            if (char.IsWhiteSpace(c)) { espaco = true; continue; }
+            if (espaco) { sb.Append(' '); espaco = false; }
+            sb.Append(c);
+            if (sb.Length >= 200) break;
+        }
+        return sb.ToString();
     }
 
     // Icone roxo de prancheta, desenhado na hora
@@ -367,8 +383,30 @@ class Item
     public string   Info   = "";
     public int      Tamanho;
     public int      Hash;
-    public Bitmap   Mini;      // miniatura (so imagens)
+    Bitmap          mini;      // miniatura (so imagens), feita na primeira vez que aparece
+    bool            miniFalhou;
     string texto;              // null quando o texto e grande e fica so no disco
+
+    public Bitmap Mini
+    {
+        get
+        {
+            if (mini != null || miniFalhou || !Imagem) return mini;
+            try
+            {
+                using (MemoryStream ms = new MemoryStream(File.ReadAllBytes(Caminho)))
+                using (Image img = Image.FromStream(ms, false, false))
+                    mini = Miniatura(img);
+            }
+            catch { miniFalhou = true; }
+            return mini;
+        }
+    }
+
+    public void LiberarMini()
+    {
+        if (mini != null) { mini.Dispose(); mini = null; }
+    }
 
     public string Texto
     {
@@ -388,9 +426,15 @@ class Item
     {
         if (caminho.EndsWith(".png", StringComparison.OrdinalIgnoreCase))
         {
-            using (FileStream fs = File.OpenRead(caminho))
-            using (Image img = Image.FromStream(fs))
-                return DeImagem(caminho, img);
+            // Na abertura so le o cabecalho do PNG: nenhuma imagem e decodificada
+            Item it = new Item();
+            it.Caminho = caminho;
+            it.Hora    = HoraDoNome(caminho);
+            it.Imagem  = true;
+            it.Titulo  = "Imagem";
+            int w, h;
+            if (TamanhoDoPng(caminho, out w, out h)) it.Info = w + " x " + h;
+            return it;
         }
         return DeTexto(caminho, File.ReadAllText(caminho, Encoding.UTF8));
     }
@@ -403,8 +447,25 @@ class Item
         it.Imagem  = true;
         it.Titulo  = "Imagem";
         it.Info    = img.Width + " x " + img.Height;
-        it.Mini    = Miniatura(img);
+        it.mini    = Miniatura(img);
         return it;
+    }
+
+    // Largura e altura ficam nos bytes 16 a 23 de todo PNG
+    public static bool TamanhoDoPng(string caminho, out int w, out int h)
+    {
+        w = h = 0;
+        try
+        {
+            byte[] b = new byte[24];
+            using (FileStream fs = File.OpenRead(caminho))
+                if (fs.Read(b, 0, 24) < 24) return false;
+            if (b[0] != 0x89 || b[1] != 0x50 || b[2] != 0x4E || b[3] != 0x47) return false;
+            w = (b[16] << 24) | (b[17] << 16) | (b[18] << 8) | b[19];
+            h = (b[20] << 24) | (b[21] << 16) | (b[22] << 8) | b[23];
+            return w > 0 && h > 0;
+        }
+        catch { return false; }
     }
 
     public static Item DeTexto(string caminho, string t)
@@ -460,8 +521,8 @@ static class Historico
     {
         Directory.CreateDirectory(Config.Pasta);
         List<string> arquivos = new List<string>();
-        arquivos.AddRange(Directory.GetFiles(Config.Pasta, "*.txt"));
-        arquivos.AddRange(Directory.GetFiles(Config.Pasta, "*.png"));
+        foreach (string f in Directory.GetFiles(Config.Pasta))
+            if (EhDoHistorico(f)) arquivos.Add(f);
         arquivos.Sort(delegate(string a, string b) { return string.CompareOrdinal(Path.GetFileName(b), Path.GetFileName(a)); });
 
         foreach (string f in arquivos)
@@ -472,7 +533,19 @@ static class Historico
         Limitar();
     }
 
-    static string NovoCaminho(string extensao)
+    // So e do historico o arquivo com o nome que o proprio programa da
+    // (20261105_002426867.png). O "Limpar tudo" apagava a pasta inteira, e
+    // foi assim que o codigo-fonte sumiu quando estava nesta pasta.
+    public static bool EhDoHistorico(string caminho)
+    {
+        string ext = Path.GetExtension(caminho).ToLowerInvariant();
+        if (ext != ".txt" && ext != ".png") return false;
+        DateTime d;
+        return DateTime.TryParseExact(Path.GetFileNameWithoutExtension(caminho), "yyyyMMdd_HHmmssfff",
+            CultureInfo.InvariantCulture, DateTimeStyles.None, out d);
+    }
+
+    public static string NovoCaminho(string extensao)
     {
         DateTime agora = DateTime.Now;
         string p;
@@ -502,12 +575,10 @@ static class Historico
         Limitar();
     }
 
-    public static void AdicionarImagem(Image img)
+    // Entra na lista depois que o arquivo ja foi gravado (ver App.GuardarImagem)
+    public static void Inserir(Item it)
     {
-        Directory.CreateDirectory(Config.Pasta);
-        string p = NovoCaminho(".png");
-        img.Save(p, ImageFormat.Png);
-        Itens.Insert(0, Item.DeImagem(p, img));
+        Itens.Insert(0, it);
         Limitar();
     }
 
@@ -535,18 +606,20 @@ static class Historico
     public static void Remover(Item it)
     {
         try { File.Delete(it.Caminho); } catch { }
-        if (it.Mini != null) { it.Mini.Dispose(); it.Mini = null; }
+        it.LiberarMini();
         Itens.Remove(it);
     }
 
-    // Apaga TUDO: lista e todos os arquivos da pasta
+    // Apaga a lista e os arquivos do historico. So os do historico: qualquer
+    // outro arquivo que esteja na pasta fica onde esta.
     public static void LimparTudo()
     {
-        foreach (Item it in Itens) if (it.Mini != null) it.Mini.Dispose();
+        foreach (Item it in Itens) it.LiberarMini();
         Itens.Clear();
         if (!Directory.Exists(Config.Pasta)) return;
         foreach (string f in Directory.GetFiles(Config.Pasta))
         {
+            if (!EhDoHistorico(f)) continue;
             try { File.Delete(f); } catch { }
         }
     }
@@ -557,6 +630,57 @@ static class Historico
         using (MemoryStream ms = new MemoryStream(File.ReadAllBytes(caminho)))
         using (Image img = Image.FromStream(ms))
             return new Bitmap(img);
+    }
+
+    // Imagem so do tamanho da caixa de previa: um print 4K ocuparia 33 MB
+    public static Bitmap LerPrevia(string caminho, int larguraMax, int alturaMax)
+    {
+        using (MemoryStream ms = new MemoryStream(File.ReadAllBytes(caminho)))
+        using (Image img = Image.FromStream(ms, false, false))
+        {
+            float esc = Math.Min(1f, Math.Min((float)larguraMax / img.Width, (float)alturaMax / img.Height));
+            int w = Math.Max(1, (int)(img.Width * esc)), h = Math.Max(1, (int)(img.Height * esc));
+            Bitmap b = new Bitmap(w, h, PixelFormat.Format32bppPArgb);
+            using (Graphics g = Graphics.FromImage(b))
+            {
+                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                g.PixelOffsetMode   = PixelOffsetMode.HighQuality;
+                g.DrawImage(img, 0, 0, w, h);
+            }
+            return b;
+        }
+    }
+
+    // Grava a imagem do historico onde a pessoa escolheu. PNG e copia do
+    // arquivo (sem perda e na hora); JPG e BMP nao tem transparencia, entao
+    // vao sobre fundo branco.
+    public static void SalvarComo(Item it, string destino)
+    {
+        string ext = Path.GetExtension(destino).ToLowerInvariant();
+        if (ext == ".png") { File.Copy(it.Caminho, destino, true); return; }
+
+        using (Bitmap img = LerImagem(it.Caminho))
+        using (Bitmap plano = new Bitmap(img.Width, img.Height, PixelFormat.Format24bppRgb))
+        {
+            using (Graphics g = Graphics.FromImage(plano))
+            {
+                g.Clear(Color.White);
+                g.DrawImage(img, 0, 0, img.Width, img.Height);
+            }
+            if (ext == ".bmp") { plano.Save(destino, ImageFormat.Bmp); return; }
+
+            foreach (ImageCodecInfo c in ImageCodecInfo.GetImageEncoders())
+            {
+                if (c.FormatID != ImageFormat.Jpeg.Guid) continue;
+                using (EncoderParameters p = new EncoderParameters(1))
+                {
+                    p.Param[0] = new EncoderParameter(System.Drawing.Imaging.Encoder.Quality, 92L);
+                    plano.Save(destino, c, p);
+                }
+                return;
+            }
+            plano.Save(destino, ImageFormat.Jpeg);
+        }
     }
 }
 
@@ -781,6 +905,231 @@ static class Emotes
 
 
 // ---------------------------------------------------------------------
+// 5d. EMOJI COLORIDO
+//
+// GDI e GDI+ (o desenho normal do Windows Forms) so sabem fazer emoji
+// preto e branco. Quem desenha a cor e o Direct2D com o DirectWrite, que
+// usam a fonte colorida que ja vem no Windows. O .NET nao traz essas
+// interfaces, entao as funcoes sao chamadas direto pela posicao de cada
+// uma na tabela do objeto (os numeros abaixo sao da documentacao do SDK).
+//
+// Cada emoji vira um Bitmap transparente guardado em cache enquanto a
+// janela esta aberta. Ao fechar, tudo e solto. Sem Direct2D, Disponivel
+// fica false e a grade volta ao emoji preto e branco.
+// ---------------------------------------------------------------------
+static class EmojiCor
+{
+    [DllImport("d2d1.dll")] static extern int D2D1CreateFactory(int tipo, ref Guid iid, IntPtr opcoes, out IntPtr fabrica);
+    [DllImport("dwrite.dll")] static extern int DWriteCreateFactory(int tipo, ref Guid iid, out IntPtr fabrica);
+    [DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleDC(IntPtr hdc);
+    [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr hdc);
+    [DllImport("gdi32.dll")] static extern IntPtr SelectObject(IntPtr hdc, IntPtr obj);
+    [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr obj);
+    [DllImport("gdi32.dll")] static extern bool GdiFlush();
+    [DllImport("gdi32.dll")] static extern IntPtr CreateDIBSection(IntPtr hdc, ref InfoBitmap bi, uint uso, out IntPtr bits, IntPtr secao, uint desloc);
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct InfoBitmap
+    {
+        public int Tamanho, Largura, Altura;
+        public short Planos, Bits;
+        public int Compressao, TamanhoImagem, Xppm, Yppm, Usadas, Importantes;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct PropsAlvo { public int Tipo, Formato, Alfa; public float DpiX, DpiY; public int Uso, Nivel; }
+    [StructLayout(LayoutKind.Sequential)] struct CorF { public float R, G, B, A; }
+    [StructLayout(LayoutKind.Sequential)] struct RetF { public float E, C, D, B; }
+
+    delegate uint FnSoltar(IntPtr eu);
+    delegate int  FnCriarAlvo(IntPtr eu, ref PropsAlvo p, out IntPtr alvo);
+    delegate int  FnCriarFormato(IntPtr eu, [MarshalAs(UnmanagedType.LPWStr)] string familia, IntPtr colecao, int peso, int estilo,
+                                 int largura, float tamanho, [MarshalAs(UnmanagedType.LPWStr)] string local, out IntPtr formato);
+    delegate int  FnDefinir(IntPtr eu, int valor);
+    delegate int  FnCriarPincel(IntPtr eu, ref CorF cor, IntPtr props, out IntPtr pincel);
+    delegate void FnDesenhar(IntPtr eu, [MarshalAs(UnmanagedType.LPWStr)] string texto, int tamanho, IntPtr formato,
+                             ref RetF ret, IntPtr pincel, int opcoes, int medida);
+    delegate void FnLimpar(IntPtr eu, ref CorF cor);
+    delegate void FnIniciar(IntPtr eu);
+    delegate int  FnTerminar(IntPtr eu, IntPtr a, IntPtr b);
+    delegate int  FnLigar(IntPtr eu, IntPtr hdc, ref Nativo.RECT r);
+    delegate void FnModoTexto(IntPtr eu, int modo);
+
+    const int MaxCache = 400;   // perto de 7 MB; passou disso, recomeca
+    const int LadoGrade = 40;
+    const float FonteGrade = 27f;
+
+    static bool falhou;
+    static IntPtr fabrica, escrita, alvo, pincel;
+    static IntPtr dc, dib, bits;
+    static int ladoDib;
+    static FnDesenhar desenhar;
+    static FnLimpar limpar;
+    static FnIniciar iniciar;
+    static FnTerminar terminar;
+    static FnLigar ligar;
+    static readonly Dictionary<int, IntPtr> formatos = new Dictionary<int, IntPtr>();
+    static readonly Dictionary<string, Bitmap> cache = new Dictionary<string, Bitmap>();
+
+    static T Funcao<T>(IntPtr objeto, int posicao) where T : class
+    {
+        IntPtr tabela = Marshal.ReadIntPtr(objeto);
+        IntPtr f = Marshal.ReadIntPtr(tabela, posicao * IntPtr.Size);
+        return (T)(object)Marshal.GetDelegateForFunctionPointer(f, typeof(T));
+    }
+
+    static void Soltar(ref IntPtr objeto)
+    {
+        if (objeto == IntPtr.Zero) return;
+        Funcao<FnSoltar>(objeto, 2)(objeto);
+        objeto = IntPtr.Zero;
+    }
+
+    static bool Preparar()
+    {
+        if (alvo != IntPtr.Zero) return true;
+        if (falhou) return false;
+        try
+        {
+            Guid idD2d = new Guid("06152247-6f50-465a-9245-118bfd3b6007");
+            Guid idDw  = new Guid("b859ee5a-d838-4b5b-a2e8-1adc7d93db48");
+            if (D2D1CreateFactory(0, ref idD2d, IntPtr.Zero, out fabrica) < 0) throw new Exception("D2D1CreateFactory");
+            if (DWriteCreateFactory(0, ref idDw, out escrita) < 0) throw new Exception("DWriteCreateFactory");
+
+            // Software: nao abre a placa de video so para desenhar emoji
+            PropsAlvo p = new PropsAlvo();
+            p.Tipo = 1;      // D2D1_RENDER_TARGET_TYPE_SOFTWARE
+            p.Formato = 87;  // DXGI_FORMAT_B8G8R8A8_UNORM
+            p.Alfa = 1;      // D2D1_ALPHA_MODE_PREMULTIPLIED
+            p.DpiX = p.DpiY = 96f;
+            if (Funcao<FnCriarAlvo>(fabrica, 16)(fabrica, ref p, out alvo) < 0) throw new Exception("CreateDCRenderTarget");
+
+            CorF preto = new CorF();
+            preto.A = 1f;
+            if (Funcao<FnCriarPincel>(alvo, 8)(alvo, ref preto, IntPtr.Zero, out pincel) < 0) throw new Exception("CreateSolidColorBrush");
+
+            Funcao<FnModoTexto>(alvo, 34)(alvo, 2);   // suavizacao em tons de cinza: combina com fundo transparente
+            desenhar = Funcao<FnDesenhar>(alvo, 27);
+            limpar   = Funcao<FnLimpar>(alvo, 47);
+            iniciar  = Funcao<FnIniciar>(alvo, 48);
+            terminar = Funcao<FnTerminar>(alvo, 49);
+            ligar    = Funcao<FnLigar>(alvo, 57);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            App.Log("Emoji colorido indisponivel: " + ex.Message);
+            falhou = true;
+            Liberar();
+            return false;
+        }
+    }
+
+    static IntPtr Formato(float tamanho)
+    {
+        int chave = (int)(tamanho * 10);
+        IntPtr f;
+        if (formatos.TryGetValue(chave, out f)) return f;
+        if (Funcao<FnCriarFormato>(escrita, 15)(escrita, "Segoe UI Emoji", IntPtr.Zero, 400, 0, 5, tamanho, "pt-br", out f) < 0)
+            return IntPtr.Zero;
+        Funcao<FnDefinir>(f, 3)(f, 2);   // centro na horizontal
+        Funcao<FnDefinir>(f, 4)(f, 2);   // centro na vertical
+        Funcao<FnDefinir>(f, 5)(f, 1);   // sem quebra de linha
+        formatos[chave] = f;
+        return f;
+    }
+
+    static bool PrepararDib(int lado)
+    {
+        if (dib != IntPtr.Zero && ladoDib == lado) return true;
+        if (dib != IntPtr.Zero) { DeleteObject(dib); dib = IntPtr.Zero; }
+        if (dc == IntPtr.Zero) dc = CreateCompatibleDC(IntPtr.Zero);
+        InfoBitmap bi = new InfoBitmap();
+        bi.Tamanho = Marshal.SizeOf(typeof(InfoBitmap));
+        bi.Largura = lado;
+        bi.Altura  = -lado;   // de cima para baixo, igual ao Bitmap
+        bi.Planos  = 1;
+        bi.Bits    = 32;
+        dib = CreateDIBSection(dc, ref bi, 0, out bits, IntPtr.Zero, 0);
+        if (dib == IntPtr.Zero) return false;
+        SelectObject(dc, dib);
+        ladoDib = lado;
+        return true;
+    }
+
+    // Desenha um emoji num Bitmap novo (quem chamou cuida dele). null = nao deu.
+    public static Bitmap Criar(string simbolo, int lado, float tamanhoFonte)
+    {
+        if (string.IsNullOrEmpty(simbolo) || !Preparar()) return null;
+        try
+        {
+            IntPtr formato = Formato(tamanhoFonte);
+            if (formato == IntPtr.Zero || !PrepararDib(lado)) return null;
+
+            Nativo.RECT r = new Nativo.RECT();
+            r.Right = lado; r.Bottom = lado;
+            if (ligar(alvo, dc, ref r) < 0) return null;
+
+            RetF area = new RetF();
+            area.D = lado; area.B = lado;
+            CorF vazio = new CorF();
+            iniciar(alvo);
+            limpar(alvo, ref vazio);
+            desenhar(alvo, simbolo, simbolo.Length, formato, ref area, pincel, 4, 0);   // 4 = fonte colorida
+            if (terminar(alvo, IntPtr.Zero, IntPtr.Zero) < 0) return null;
+            GdiFlush();
+
+            Bitmap b = new Bitmap(lado, lado, PixelFormat.Format32bppPArgb);
+            BitmapData d = b.LockBits(new Rectangle(0, 0, lado, lado), ImageLockMode.WriteOnly, PixelFormat.Format32bppPArgb);
+            Nativo.CopiarMemoria(d.Scan0, bits, new IntPtr(lado * lado * 4));
+            b.UnlockBits(d);
+            return b;
+        }
+        catch (Exception ex)
+        {
+            App.Log("Erro ao desenhar emoji: " + ex.Message);
+            falhou = true;
+            return null;
+        }
+    }
+
+    // Emoji da grade, em cache. Quem recebe nao pode liberar o Bitmap.
+    public static Bitmap DaGrade(string simbolo)
+    {
+        Bitmap b;
+        if (cache.TryGetValue(simbolo, out b)) return b;
+        if (cache.Count >= MaxCache) LimparCache();
+        b = Criar(simbolo, LadoGrade, FonteGrade);
+        if (b != null) cache[simbolo] = b;
+        return b;
+    }
+
+    static void LimparCache()
+    {
+        foreach (Bitmap b in cache.Values) b.Dispose();
+        cache.Clear();
+    }
+
+    // Solta tudo quando a janela fecha
+    public static void Liberar()
+    {
+        LimparCache();
+        foreach (IntPtr f in new List<IntPtr>(formatos.Values)) { IntPtr x = f; Soltar(ref x); }
+        formatos.Clear();
+        Soltar(ref pincel);
+        Soltar(ref alvo);
+        Soltar(ref escrita);
+        Soltar(ref fabrica);
+        if (dib != IntPtr.Zero) { DeleteObject(dib); dib = IntPtr.Zero; }
+        if (dc != IntPtr.Zero) { DeleteDC(dc); dc = IntPtr.Zero; }
+        bits = IntPtr.Zero;
+        ladoDib = 0;
+        desenhar = null; limpar = null; iniciar = null; terminar = null; ligar = null;
+    }
+}
+
+
+// ---------------------------------------------------------------------
 // 6. NUCLEO: escuta a area de transferencia e o teclado
 // ---------------------------------------------------------------------
 class Nucleo : NativeWindow, IDisposable
@@ -794,11 +1143,14 @@ class Nucleo : NativeWindow, IDisposable
     public event Action<int> AcaoPedida;          // indice em Config.Atalhos
     public event Action<Atalho> TeclaGravada;     // usado na tela de configurar atalho
     public bool GanchoOk;
-    public bool Gravando;                         // true = a proxima combinacao vai para TeclaGravada
+    public volatile bool Gravando;                // true = a proxima combinacao vai para TeclaGravada
 
     IntPtr gancho = IntPtr.Zero;
+    IntPtr alvoMensagens;   // janela deste objeto, lida pela thread do gancho
     Nativo.HookProc proc;   // guardado para o coletor de lixo nao apagar
     int teclaEngolida;      // tecla escondida do Windows ate ser solta
+    Thread threadGancho;
+    uint idThreadGancho;
 
     public Nucleo()
     {
@@ -811,10 +1163,35 @@ class Nucleo : NativeWindow, IDisposable
 
         RegistrarReservas();
 
-        // Gancho de teclado: pega os atalhos antes do Windows e dos jogos
+        // Gancho de teclado: pega os atalhos antes do Windows e dos jogos.
+        // Roda numa thread so dele porque TODA tecla do computador passa por
+        // aqui: se o gancho dividisse a thread com a janela, gravar um PNG ou
+        // abrir um dialogo deixaria o teclado inteiro travando.
+        alvoMensagens = Handle;
+#if !TESTE
+        using (ManualResetEvent pronto = new ManualResetEvent(false))
+        {
+            threadGancho = new Thread(delegate() { LacoDoGancho(pronto); }, 128 * 1024);
+            threadGancho.IsBackground = true;
+            threadGancho.Priority = ThreadPriority.AboveNormal;
+            threadGancho.Start();
+            pronto.WaitOne(3000);
+        }
+#endif
+    }
+
+    void LacoDoGancho(ManualResetEvent pronto)
+    {
         proc = Gancho;
         gancho = Nativo.SetWindowsHookEx(13, proc, Nativo.GetModuleHandle(null), 0);
         GanchoOk = gancho != IntPtr.Zero;
+        idThreadGancho = Nativo.GetCurrentThreadId();
+        pronto.Set();
+
+        Nativo.MSG m;
+        while (Nativo.GetMessage(out m, IntPtr.Zero, 0, 0) > 0) { }
+
+        if (gancho != IntPtr.Zero) { Nativo.UnhookWindowsHookEx(gancho); gancho = IntPtr.Zero; }
     }
 
     // Reserva: registra os atalhos tambem do jeito normal do Windows
@@ -869,7 +1246,7 @@ class Nucleo : NativeWindow, IDisposable
                 if (Gravando)
                 {
                     int mods = ModsAtuais();
-                    Nativo.PostMessage(Handle, WM_GRAVOU, new IntPtr(vk), new IntPtr(mods));
+                    Nativo.PostMessage(alvoMensagens, WM_GRAVOU, new IntPtr(vk), new IntPtr(mods));
                     Engolir(vk, mods);
                     return new IntPtr(1);
                 }
@@ -882,7 +1259,7 @@ class Nucleo : NativeWindow, IDisposable
                     if (modsAgora < 0) modsAgora = ModsAtuais();
                     if (lista[i].Mods != modsAgora) continue;
 
-                    Nativo.PostMessage(Handle, WM_ACAO, new IntPtr(i), IntPtr.Zero);
+                    Nativo.PostMessage(alvoMensagens, WM_ACAO, new IntPtr(i), IntPtr.Zero);
                     Engolir(vk, modsAgora);
                     return new IntPtr(1);
                 }
@@ -926,7 +1303,12 @@ class Nucleo : NativeWindow, IDisposable
 
     public void Dispose()
     {
-        if (gancho != IntPtr.Zero) { Nativo.UnhookWindowsHookEx(gancho); gancho = IntPtr.Zero; }
+        if (idThreadGancho != 0)
+        {
+            Nativo.PostThreadMessage(idThreadGancho, 0x0012, IntPtr.Zero, IntPtr.Zero);   // WM_QUIT
+            threadGancho.Join(500);
+            idThreadGancho = 0;
+        }
         Nativo.RemoveClipboardFormatListener(Handle);
         for (int i = 0; i < Config.Atalhos.Length; i++) Nativo.UnregisterHotKey(Handle, i + 1);
         DestroyHandle();
@@ -940,8 +1322,9 @@ class Nucleo : NativeWindow, IDisposable
 
 static class Captura
 {
-    // Tira o print e devolve o caminho do arquivo salvo (ou null)
-    public static string Tirar(bool telaInteira)
+    // Tira o print e devolve a imagem (quem chamou libera). A gravacao fica
+    // para App.TirarPrint, fora da thread da janela.
+    public static Bitmap Tirar(bool telaInteira)
     {
         // Le as coordenadas reais mesmo com zoom de tela (125%, 150%...)
         IntPtr dpiAntigo = IntPtr.Zero;
@@ -954,31 +1337,29 @@ static class Captura
             bool janela = !telaInteira && JanelaValida(h, out area);
             if (!janela) area = MonitorDe(h);
 
-            using (Bitmap bmp = new Bitmap(area.Width, area.Height, PixelFormat.Format32bppRgb))
-            {
-                using (Graphics g = Graphics.FromImage(bmp))
-                    g.CopyFromScreen(area.Location, Point.Empty, area.Size, CopyPixelOperation.SourceCopy);
+            Bitmap bmp = new Bitmap(area.Width, area.Height, PixelFormat.Format32bppRgb);
+            using (Graphics g = Graphics.FromImage(bmp))
+                g.CopyFromScreen(area.Location, Point.Empty, area.Size, CopyPixelOperation.SourceCopy);
 
-                // Alguns jogos aparecem pretos na copia de tela: tenta pela janela
-                if (janela && QuasePreta(bmp)) TentarPrintWindow(h, area, bmp);
-
-                Directory.CreateDirectory(Config.PastaPrints);
-                string arq = Path.Combine(Config.PastaPrints,
-                    "captura-" + DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss") + ".png");
-                for (int n = 2; File.Exists(arq); n++)
-                    arq = Path.Combine(Config.PastaPrints,
-                        "captura-" + DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss") + "_" + n + ".png");
-
-                bmp.Save(arq, ImageFormat.Png);
-                Clipboard.SetDataObject(bmp, true, 10, 100);
-                return arq;
-            }
+            // Alguns jogos aparecem pretos na copia de tela: tenta pela janela
+            if (janela && QuasePreta(bmp)) TentarPrintWindow(h, area, bmp);
+            return bmp;
         }
         finally
         {
             if (dpiAntigo != IntPtr.Zero)
                 try { Nativo.SetThreadDpiAwarenessContext(dpiAntigo); } catch { }
         }
+    }
+
+    public static string CaminhoNovo()
+    {
+        Directory.CreateDirectory(Config.PastaPrints);
+        string base_ = "captura-" + DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
+        string arq = Path.Combine(Config.PastaPrints, base_ + ".png");
+        for (int n = 2; File.Exists(arq); n++)
+            arq = Path.Combine(Config.PastaPrints, base_ + "_" + n + ".png");
+        return arq;
     }
 
     static bool JanelaValida(IntPtr h, out Rectangle area)
@@ -1293,8 +1674,10 @@ class GradeEmotes : Control
         int i = Indice(e.Location);
         if (i != sobre)
         {
+            // Redesenha so as duas celulas que mudaram
+            if (sobre >= 0) Invalidate(Ret(sobre));
+            if (i >= 0) Invalidate(Ret(i));
             sobre = i;
-            Invalidate();
             if (Destacado != null) Destacado(i >= 0 ? itens[i] : Atual);
         }
         base.OnMouseMove(e);
@@ -1323,6 +1706,8 @@ class GradeEmotes : Control
     {
         Graphics g = e.Graphics;
         g.SmoothingMode = SmoothingMode.AntiAlias;
+        g.InterpolationMode = InterpolationMode.NearestNeighbor;   // 1 para 1: sem custo de filtro
+        g.PixelOffsetMode = PixelOffsetMode.Half;
         int c = Colunas;
         int primeira = Math.Max(0, (rolagem - Margem) / Celula) * c;
         int ultima = Math.Min(itens.Count - 1, ((rolagem + ClientSize.Height) / Celula + 1) * c);
@@ -1330,12 +1715,17 @@ class GradeEmotes : Control
         for (int i = primeira; i <= ultima; i++)
         {
             Rectangle r = Ret(i);
+            if (!r.IntersectsWith(e.ClipRectangle)) continue;
             if (i == selecionado || i == sobre)
             {
                 using (GraphicsPath p = Tema.Arredondado(Rectangle.Inflate(r, -2, -2), 6))
                     g.FillPath(Tema.Pincel(i == selecionado ? Tema.Selecao : Tema.Campo), p);
             }
-            TextRenderer.DrawText(g, itens[i].Simbolo, Tema.Emote, r, Tema.Texto, Tema.Centro);
+            Bitmap b = EmojiCor.DaGrade(itens[i].Simbolo);
+            if (b != null)
+                g.DrawImage(b, new Rectangle(r.X + (r.Width - b.Width) / 2, r.Y + (r.Height - b.Height) / 2, b.Width, b.Height));
+            else
+                TextRenderer.DrawText(g, itens[i].Simbolo, Tema.Emote, r, Tema.Texto, Tema.Centro);
         }
     }
 }
@@ -1422,13 +1812,18 @@ class Janela : Form
     Panel barraBusca;
     TextBox busca;
     Panel[] paginas;
+    Panel conteudo;
     ToolTip dicas;
+    Timer esperaBusca;           // so filtra quando a digitacao da uma pausa
+    bool buscaSilenciosa;        // limpando a busca por codigo: nao agenda filtro
+    bool dialogoAberto;          // janela de "Salvar como" aberta: nao fecha ao perder o foco
 
     // Historico
     ListaCartoes listaHist;
     Label vazioHist, infoHist;
     TextBox previaTexto;
     PictureBox previaImagem;
+    Label botaoSalvarImagem;
     readonly List<Item> visHist = new List<Item>();
     bool confirmarLimpar;
 
@@ -1547,7 +1942,15 @@ class Janela : Form
         busca.BackColor = Tema.Campo;
         busca.ForeColor = Tema.Texto;
         busca.Font = Tema.Normal;
-        busca.TextChanged += delegate { Filtrar(); };
+        esperaBusca = new Timer();
+        esperaBusca.Interval = 120;
+        esperaBusca.Tick += delegate { esperaBusca.Stop(); Filtrar(); };
+        busca.TextChanged += delegate
+        {
+            if (buscaSilenciosa) return;
+            esperaBusca.Stop();
+            esperaBusca.Start();
+        };
         caixaBusca.Controls.Add(busca);
         barraBusca.Controls.Add(caixaBusca);
 
@@ -1559,10 +1962,10 @@ class Janela : Form
         rodape.Padding = new Padding(14, 0, 0, 0);
 
         // ---- Paginas ----
-        Panel conteudo = NovoPainel(DockStyle.Fill, Tema.Fundo);
+        // Cada pagina so e montada na primeira vez que abre
+        conteudo = NovoPainel(DockStyle.Fill, Tema.Fundo);
         conteudo.Padding = new Padding(16, 0, 16, 0);
-        paginas = new Panel[] { CriarHistorico(), CriarSalvos(), CriarEmotes(), CriarConfig() };
-        foreach (Panel p in paginas) { p.Visible = false; conteudo.Controls.Add(p); }
+        paginas = new Panel[4];
 
         // A ordem importa: o ultimo adicionado fica na borda de fora
         raiz.Controls.AddRange(new Control[] { conteudo, rodape, barraBusca, cabecalho });
@@ -1634,13 +2037,30 @@ class Janela : Form
         t.BackColor = Tema.Painel;
         t.ForeColor = Tema.Texto;
         t.Font = Tema.Mono;
+        t.HandleCreated += delegate { Nativo.TemaEscuro(t.Handle); };
         return t;
     }
 
     static string Quebras(string t)
     {
         if (t.Length > 200000) t = t.Substring(0, 200000) + "\n...";
-        return Regex.Replace(t, "(?<!\r)\n", "\r\n");
+        StringBuilder sb = new StringBuilder(t.Length + 64);
+        char antes = '\0';
+        foreach (char c in t)
+        {
+            if (c == '\n' && antes != '\r') sb.Append('\r');
+            sb.Append(c);
+            antes = c;
+        }
+        return sb.ToString();
+    }
+
+    void LimparBusca()
+    {
+        esperaBusca.Stop();
+        buscaSilenciosa = true;
+        busca.Text = "";
+        buscaSilenciosa = false;
     }
 
     // Digitar com a lista em foco vai para a busca
@@ -1662,8 +2082,16 @@ class Janela : Form
         PararGravacao();
         ResetarLimpar();
 
+        if (paginas[p] == null)
+        {
+            paginas[p] = p == PgHistorico ? CriarHistorico() : p == PgSalvos ? CriarSalvos() :
+                         p == PgEmotes ? CriarEmotes() : CriarConfig();
+            paginas[p].Visible = false;
+            conteudo.Controls.Add(paginas[p]);
+        }
+
         pagina = p;
-        for (int i = 0; i < paginas.Length; i++) paginas[i].Visible = i == p;
+        for (int i = 0; i < paginas.Length; i++) if (paginas[i] != null) paginas[i].Visible = i == p;
         for (int i = 0; i < abas.Length; i++) abas[i].Ativa = i == p;
         botaoConfig.ForeColor = p == PgConfig ? Tema.Destaque : Tema.Suave;
         barraBusca.Visible = p != PgConfig;
@@ -1673,12 +2101,13 @@ class Janela : Form
         switch (p)
         {
             case PgHistorico:
-                rodape.Text = "Clique ou Enter  copiar" + Tema.Ponto + "Bot\u00e3o direito  mais op\u00e7\u00f5es" +
+                rodape.Text = "Clique  ver" + Tema.Ponto + "Duplo clique ou Enter  " + AcaoDeUsar() + Tema.Ponto +
+                              "Bot\u00e3o direito  mais op\u00e7\u00f5es" + Tema.Ponto + "Ctrl+S  salvar imagem" +
                               Tema.Ponto + "Shift+Del  apagar" + Tema.Ponto + "Esc  fechar";
                 break;
             case PgSalvos:
-                rodape.Text = "Clique ou Enter  copiar" + Tema.Ponto + "Bot\u00e3o direito  editar ou apagar" +
-                              Tema.Ponto + "Ctrl+S  salvar a edi\u00e7\u00e3o";
+                rodape.Text = "Clique  ver" + Tema.Ponto + "Duplo clique ou Enter  " + AcaoDeUsar() + Tema.Ponto +
+                              "Bot\u00e3o direito  editar ou apagar" + Tema.Ponto + "Ctrl+S  salvar a edi\u00e7\u00e3o";
                 break;
             case PgEmotes:
                 rodape.Text = "Clique ou Enter  copiar" + Tema.Ponto + "Setas  navegar" + Tema.Ponto + "Digite para buscar";
@@ -1689,11 +2118,13 @@ class Janela : Form
                 break;
         }
 
-        if (busca.Text.Length > 0) busca.Text = "";   // dispara Filtrar
-        else Filtrar();
+        LimparBusca();
+        Filtrar();
         AtualizarDicaBusca();
         if (IsHandleCreated && p != PgConfig) busca.Focus();
     }
+
+    static string AcaoDeUsar() { return Config.ColarAuto ? "colar" : "copiar"; }
 
     void AtualizarDicaBusca()
     {
@@ -1749,11 +2180,12 @@ class Janela : Form
             c.Icone  = it.Imagem ? null : "Aa";
         };
         listaHist.SelectedIndexChanged += delegate { PreviaHistorico(); };
-        listaHist.MouseClick += delegate(object s, MouseEventArgs e)
+        // Um clique so seleciona e mostra a previa; dois cliques usam o item
+        listaHist.MouseDoubleClick += delegate(object s, MouseEventArgs e)
         {
             if (e.Button != MouseButtons.Left) return;
             int i = listaHist.IndexFromPoint(e.Location);
-            if (i >= 0) { listaHist.SelectedIndex = i; Escolher(visHist[i]); }
+            if (i >= 0 && i < visHist.Count) Escolher(visHist[i]);
         };
         listaHist.KeyPress += RedirecionarDigitacao;
         listaHist.ContextMenuStrip = MenuHistorico();
@@ -1772,6 +2204,19 @@ class Janela : Form
         infoHist.Dock = DockStyle.Top;
         infoHist.Height = 30;
         infoHist.TextAlign = ContentAlignment.MiddleLeft;
+
+        botaoSalvarImagem = BotaoCheio("Salvar como...", Tema.Campo, Tema.CampoSob);
+        botaoSalvarImagem.Font = Tema.Pequena;
+        botaoSalvarImagem.Dock = DockStyle.Right;
+        botaoSalvarImagem.Width = 110;
+        botaoSalvarImagem.Visible = false;
+        botaoSalvarImagem.MouseClick += delegate(object s, MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Left) SalvarImagemComo();
+        };
+        dicas.SetToolTip(botaoSalvarImagem, "Salvar esta imagem como arquivo no computador (Ctrl+S)");
+        infoHist.Controls.Add(botaoSalvarImagem);
+
         previaTexto = NovoTextoPrevia();
         previaImagem = new PictureBox();
         previaImagem.Dock = DockStyle.Fill;
@@ -1789,7 +2234,9 @@ class Janela : Form
         ContextMenuStrip m = CoresMenu.NovoMenu();
         ToolStripMenuItem copiar = new ToolStripMenuItem("Copiar");
         ToolStripMenuItem salvar = new ToolStripMenuItem("Salvar na aba Salvos");
+        ToolStripMenuItem salvarArquivo = new ToolStripMenuItem("Salvar imagem como...");
         ToolStripMenuItem apagar = new ToolStripMenuItem("Apagar");
+        salvarArquivo.Click += delegate { SalvarImagemComo(); };
         copiar.Click += delegate { Item it = ItemHistAtual(); if (it != null) Escolher(it); };
         salvar.Click += delegate
         {
@@ -1799,14 +2246,57 @@ class Janela : Form
             infoHist.Text = "\u2713  Salvo na aba Salvos";
         };
         apagar.Click += delegate { ApagarHistorico(); };
-        m.Items.AddRange(new ToolStripItem[] { copiar, salvar, new ToolStripSeparator(), apagar });
+        m.Items.AddRange(new ToolStripItem[] { copiar, salvar, salvarArquivo, new ToolStripSeparator(), apagar });
         m.Opening += delegate(object s, System.ComponentModel.CancelEventArgs e)
         {
             Item it = ItemHistAtual();
             if (it == null) { e.Cancel = true; return; }
-            salvar.Enabled = !it.Imagem;
+            salvar.Visible = !it.Imagem;
+            salvarArquivo.Visible = it.Imagem;
         };
         return m;
+    }
+
+    // Abre "Salvar como" para a imagem selecionada no historico
+    void SalvarImagemComo()
+    {
+        Item it = ItemHistAtual();
+        if (it == null || !it.Imagem) return;
+
+        dialogoAberto = true;
+        try
+        {
+            using (SaveFileDialog d = new SaveFileDialog())
+            {
+                d.Title = "Salvar imagem como";
+                d.Filter = "Imagem PNG (*.png)|*.png|Imagem JPG (*.jpg)|*.jpg|Bitmap (*.bmp)|*.bmp";
+                d.FileName = "imagem-" + it.Hora.ToString("yyyy-MM-dd_HH-mm-ss") + ".png";
+                d.DefaultExt = "png";
+                d.AddExtension = true;
+                d.OverwritePrompt = true;
+                d.RestoreDirectory = true;
+                if (Directory.Exists(Config.PastaPrints)) d.InitialDirectory = Config.PastaPrints;
+                if (d.ShowDialog(this) != DialogResult.OK) return;
+
+                try
+                {
+                    Historico.SalvarComo(it, d.FileName);
+                    infoHist.Text = "\u2713  Salvo em " + d.FileName;
+                }
+                catch (Exception ex)
+                {
+                    App.Log("Erro ao salvar imagem: " + ex.Message);
+                    infoHist.Text = "N\u00e3o consegui salvar: " + ex.Message;
+                }
+            }
+        }
+        finally
+        {
+            dialogoAberto = false;
+            Activate();
+            busca.Focus();
+            App.Aparar();
+        }
     }
 
     Item ItemHistAtual()
@@ -1843,6 +2333,7 @@ class Janela : Form
         if (velha != null) velha.Dispose();
 
         Item it = ItemHistAtual();
+        botaoSalvarImagem.Visible = it != null && it.Imagem;
         if (it == null)
         {
             infoHist.Text = "";
@@ -1854,7 +2345,7 @@ class Janela : Form
 
         if (it.Imagem)
         {
-            try { previaImagem.Image = Historico.LerImagem(it.Caminho); } catch { }
+            try { previaImagem.Image = Historico.LerPrevia(it.Caminho, 520, 460); } catch { }
             previaImagem.Visible = true;
             previaTexto.Visible = false;
             infoHist.Text = "IMAGEM" + Tema.Ponto + it.Info + Tema.Ponto + Tema.Hora(it.Hora);
@@ -1922,13 +2413,14 @@ class Janela : Form
             c.FonteIcone = Tema.Engrenagem;
         };
         listaSalvos.SelectedIndexChanged += delegate { if (!editando) PreviaSalvo(); };
-        listaSalvos.MouseClick += delegate(object s, MouseEventArgs e)
+        listaSalvos.MouseDoubleClick += delegate(object s, MouseEventArgs e)
         {
             if (e.Button != MouseButtons.Left) return;
             int i = listaSalvos.IndexFromPoint(e.Location);
-            if (i < 0) return;
+            if (i < 0 || i >= visSalvos.Count) return;
+            Salvo alvo = visSalvos[i];   // a edicao pode mudar a ordem da lista
             if (editando) SalvarEdicao();
-            Escolher(visSalvos[Math.Min(i, visSalvos.Count - 1)].Texto);
+            Escolher(alvo.Texto);
         };
         listaSalvos.KeyPress += RedirecionarDigitacao;
         listaSalvos.ContextMenuStrip = MenuSalvos();
@@ -2094,10 +2586,13 @@ class Janela : Form
         for (int k = 9; k >= 0; k--)   // ao contrario: o ultimo adicionado fica mais a esquerda
         {
             int cat = k == 0 ? Emotes.Recentes : k - 1;
-            Label b = NovoRotulo(k == 0 ? "\U0001F552" : Emotes.IconesCategorias[k - 1], Tema.EmoteMeio, Tema.Suave, Tema.Painel);
+            string icone = k == 0 ? "\U0001F552" : Emotes.IconesCategorias[k - 1];
+            Label b = NovoRotulo("", Tema.Normal, Tema.Suave, Tema.Painel);
             b.Dock = DockStyle.Left;
             b.Width = 46;
-            b.TextAlign = ContentAlignment.MiddleCenter;
+            b.Image = EmojiCor.Criar(icone, 30, 20f);
+            b.ImageAlign = ContentAlignment.MiddleCenter;
+            if (b.Image == null) { b.Text = icone; b.TextAlign = ContentAlignment.MiddleCenter; }
             b.Cursor = Cursors.Hand;
             b.MouseDown += delegate { MostrarCategoria(cat); };
             dicas.SetToolTip(b, k == 0 ? "Recentes" : Emotes.Categorias[k - 1]);
@@ -2111,9 +2606,10 @@ class Janela : Form
         status.Padding = new Padding(10, 0, 10, 0);
         Panel linha = NovoPainel(DockStyle.Top, Tema.Fundo);
         linha.Height = 1;
-        statusIcone = NovoRotulo("", Tema.EmoteGrande, Tema.Texto, Tema.Painel);
+        statusIcone = NovoRotulo("", Tema.Emote, Tema.Texto, Tema.Painel);
         statusIcone.Dock = DockStyle.Left;
         statusIcone.Width = 60;
+        statusIcone.ImageAlign = ContentAlignment.MiddleCenter;
         statusIcone.TextAlign = ContentAlignment.MiddleCenter;
         statusNome = NovoRotulo("", Tema.Normal, Tema.Texto, Tema.Painel);
         statusNome.Dock = DockStyle.Fill;
@@ -2137,8 +2633,8 @@ class Janela : Form
     void MostrarCategoria(int cat)
     {
         categoria = cat;
-        if (busca.Text.Length > 0) busca.Text = "";   // dispara Filtrar
-        else RecarregarEmotes();
+        LimparBusca();
+        RecarregarEmotes();
     }
 
     void RecarregarEmotes()
@@ -2164,8 +2660,13 @@ class Janela : Form
 
     void MostrarEmote(Emote e)
     {
+        Image velha = statusIcone.Image;
+        statusIcone.Image = null;
+        if (velha != null) velha.Dispose();
+
         if (e == null) { statusIcone.Text = ""; statusNome.Text = ""; return; }
-        statusIcone.Text = e.Simbolo;
+        statusIcone.Image = EmojiCor.Criar(e.Simbolo, 46, 31f);
+        statusIcone.Text = statusIcone.Image == null ? e.Simbolo : "";
         statusNome.Text = e.Nome.Length > 0 ? char.ToUpper(e.Nome[0]) + e.Nome.Substring(1) : "";
     }
 
@@ -2232,13 +2733,29 @@ class Janela : Form
         optIniciar.Mudou += delegate { App.DefinirIniciar(optIniciar.Marcado); };
         y += 14;
 
-        pg.Controls.Add(Posicionar(NovoRotulo("Prints: " + Config.PastaPrints, Tema.Pequena, Tema.Suave, Tema.Painel), 24, y, 640, 20));
-        y += 22;
-        pg.Controls.Add(Posicionar(NovoRotulo("Hist\u00f3rico: " + Config.Pasta, Tema.Pequena, Tema.Suave, Tema.Painel), 24, y, 640, 20));
-        y += 22;
-        pg.Controls.Add(Posicionar(NovoRotulo("Salvos e configura\u00e7\u00f5es: " + Config.PastaDados, Tema.Pequena, Tema.Suave, Tema.Painel), 24, y, 640, 20));
+        pg.Controls.Add(LinhaPasta(24, ref y, "Prints: ", Config.PastaPrints));
+        pg.Controls.Add(LinhaPasta(24, ref y, "Hist\u00f3rico: ", Config.Pasta));
+        pg.Controls.Add(LinhaPasta(24, ref y, "Salvos e configura\u00e7\u00f5es: ", Config.PastaDados));
 
         return pg;
+    }
+
+    // Caminho clicavel: abre a pasta no Explorer
+    Label LinhaPasta(int x, ref int y, string nome, string pasta)
+    {
+        string texto = nome + pasta;
+        Label l = NovoRotulo(texto, Tema.Pequena, Tema.Suave, Tema.Painel);
+        Posicionar(l, x, y, TextRenderer.MeasureText(texto, Tema.Pequena).Width + 8, 20);
+        l.Cursor = Cursors.Hand;
+        l.MouseEnter += delegate { l.ForeColor = Tema.Destaque; };
+        l.MouseLeave += delegate { l.ForeColor = Tema.Suave; };
+        l.MouseDown  += delegate(object s, MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Left) App.AbrirPasta(pasta);
+        };
+        dicas.SetToolTip(l, "Clique para abrir a pasta");
+        y += 22;
+        return l;
     }
 
     Interruptor LinhaOpcao(Panel pg, ref int y, string texto)
@@ -2354,8 +2871,12 @@ class Janela : Form
         if (pagina == PgHistorico || pagina == PgSalvos)
         {
             ListaCartoes l = pagina == PgHistorico ? listaHist : listaSalvos;
+            AplicarBuscaPendente(k);
             switch (k)
             {
+                case Keys.Control | Keys.S:
+                    if (pagina == PgHistorico) SalvarImagemComo();
+                    return true;
                 case Keys.Enter:
                     if (pagina == PgHistorico) { Item it = ItemHistAtual(); if (it != null) Escolher(it); }
                     else { Salvo s = SalvoAtual(); if (s != null) Escolher(s.Texto); }
@@ -2382,6 +2903,7 @@ class Janela : Form
         else if (pagina == PgEmotes)
         {
             bool textoNaBusca = busca.Focused && busca.TextLength > 0;
+            AplicarBuscaPendente(k);
             switch (k)
             {
                 case Keys.Enter: grade.EscolherAtual(); return true;
@@ -2394,21 +2916,36 @@ class Janela : Form
         return base.ProcessCmdKey(ref msg, k);
     }
 
+    // Enter ou seta logo depois de digitar: filtra antes de agir
+    void AplicarBuscaPendente(Keys k)
+    {
+        if (!esperaBusca.Enabled) return;
+        if (k == Keys.Enter || k == Keys.Down || k == Keys.Up || k == Keys.Left || k == Keys.Right)
+        {
+            esperaBusca.Stop();
+            Filtrar();
+        }
+    }
+
     protected override void OnShown(EventArgs e)
     {
         base.OnShown(e);
         AtualizarDicaBusca();
-        Nativo.TemaEscuro(previaTexto.Handle);
-        Nativo.TemaEscuro(editor.Handle);
+#if !TESTE
         Activate();
+#endif
         if (pagina != PgConfig) busca.Focus();
     }
+
+#if TESTE
+    protected override bool ShowWithoutActivation { get { return true; } }
+#endif
 
     // Fecha ao clicar fora, como o Win + V original
     protected override void OnDeactivate(EventArgs e)
     {
         base.OnDeactivate(e);
-        if (gravando < 0) Fechar();
+        if (gravando < 0 && !dialogoAberto) Fechar();
     }
 
     protected override void OnFormClosing(FormClosingEventArgs e)
@@ -2429,6 +2966,12 @@ class Janela : Form
                 previaImagem.Image = null;
             }
             if (dicas != null) dicas.Dispose();
+            if (esperaBusca != null) esperaBusca.Dispose();
+            if (botoesCat != null)
+                foreach (Label b in botoesCat)
+                    if (b != null && b.Image != null) { b.Image.Dispose(); b.Image = null; }
+            if (statusIcone != null && statusIcone.Image != null) { statusIcone.Image.Dispose(); statusIcone.Image = null; }
+            EmojiCor.Liberar();
             Emotes.Liberar();
         }
         base.Dispose(disposing);
@@ -2453,9 +2996,13 @@ class App : ApplicationContext
     uint ultimaSeq;
     int tentativas;
     bool pausado;
+    readonly SynchronizationContext contexto;
 
     public App()
     {
+        // Devolve o resultado das gravacoes para a thread da janela
+        contexto = new WindowsFormsSynchronizationContext();
+
         Config.Carregar();
         Historico.Carregar();
 
@@ -2514,11 +3061,7 @@ class App : ApplicationContext
         };
 
         ToolStripMenuItem pasta = new ToolStripMenuItem("Abrir pasta de prints");
-        pasta.Click += delegate
-        {
-            Directory.CreateDirectory(Config.PastaPrints);
-            Process.Start("explorer.exe", "\"" + Config.PastaPrints + "\"");
-        };
+        pasta.Click += delegate { AbrirPasta(Config.PastaPrints); };
 
         ToolStripMenuItem limpar = new ToolStripMenuItem("Limpar hist\u00f3rico");
         limpar.Click += delegate
@@ -2567,9 +3110,8 @@ class App : ApplicationContext
             }
             else if (Clipboard.ContainsImage())
             {
-                using (Image img = Clipboard.GetImage())
-                    if (img != null) Historico.AdicionarImagem(img);
-                Aparar();
+                Image img = Clipboard.GetImage();
+                if (img != null) GuardarImagem(img, null);
             }
             ultimaSeq = seq;
             tentativas = 0;
@@ -2589,11 +3131,64 @@ class App : ApplicationContext
     {
         try
         {
-            if (Captura.Tirar(telaInteira) != null && Config.SomAoCapturar)
-                System.Media.SystemSounds.Asterisk.Play();
+            Bitmap bmp = Captura.Tirar(telaInteira);
+            try
+            {
+                Clipboard.SetDataObject(bmp, true, 10, 100);
+                // Ja vai direto para o historico: nao precisa ler de volta
+                ultimaSeq = Nativo.GetClipboardSequenceNumber();
+            }
+            catch (Exception ex) { Log("Erro ao copiar o print: " + ex.Message); }
+
+            if (Config.SomAoCapturar) System.Media.SystemSounds.Asterisk.Play();
+            GuardarImagem(bmp, Captura.CaminhoNovo());
         }
         catch (Exception ex) { Log("Erro ao tirar print: " + ex.Message); }
-        Aparar();
+    }
+
+    // Grava a imagem fora da thread da janela: um PNG grande leva centenas de
+    // milissegundos. A imagem passa a pertencer a este metodo. Com arquivoPrint,
+    // grava tambem na pasta de prints. A thread nao e de fundo de proposito:
+    // sair do programa logo depois de um print nao pode perder o arquivo.
+    void GuardarImagem(Image img, string arquivoPrint)
+    {
+        string destino = pausado ? null : Historico.NovoCaminho(".png");
+        Thread t = new Thread(delegate()
+        {
+            Item novo = null;
+            try
+            {
+                string feito = null;
+                if (arquivoPrint != null)
+                {
+                    img.Save(arquivoPrint, ImageFormat.Png);
+                    feito = arquivoPrint;
+                }
+                if (destino != null)
+                {
+                    Directory.CreateDirectory(Config.Pasta);
+                    if (feito != null) File.Copy(feito, destino, true);
+                    else img.Save(destino, ImageFormat.Png);
+                    novo = Item.DeImagem(destino, img);
+                }
+            }
+            catch (Exception ex) { Log("Erro ao gravar imagem: " + ex.Message); }
+            finally { img.Dispose(); }
+
+            if (novo == null) { Aparar(); return; }
+            try
+            {
+                contexto.Post(delegate
+                {
+                    Historico.Inserir(novo);
+                    if (janela != null) janela.Recarregar();
+                }, null);
+            }
+            catch { }
+            Aparar();
+        }, 512 * 1024);
+        t.Priority = ThreadPriority.BelowNormal;
+        t.Start();
     }
 
     // ---- Janela ----
@@ -2690,13 +3285,31 @@ class App : ApplicationContext
 
     // ---- Utilidades ----
 
-    // Devolve ao Windows a memoria que nao esta em uso
+    public static void AbrirPasta(string pasta)
+    {
+        try
+        {
+            Directory.CreateDirectory(pasta);
+            Process.Start("explorer.exe", "\"" + pasta + "\"");
+        }
+        catch (Exception ex) { Log("Erro ao abrir pasta: " + ex.Message); }
+    }
+
+    // Devolve ao Windows a memoria que nao esta em uso. Espera 1,5 s de calma
+    // e roda fora da janela: varios pedidos seguidos viram uma limpeza so.
+    static System.Threading.Timer aparador;
+
     public static void Aparar()
     {
-        GC.Collect();
-        GC.WaitForPendingFinalizers();
-        GC.Collect();
-        try { Nativo.EmptyWorkingSet(Nativo.GetCurrentProcess()); } catch { }
+        if (aparador == null)
+            aparador = new System.Threading.Timer(delegate
+            {
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                GC.Collect();
+                try { Nativo.EmptyWorkingSet(Nativo.GetCurrentProcess()); } catch { }
+            }, null, Timeout.Infinite, Timeout.Infinite);
+        aparador.Change(1500, Timeout.Infinite);
     }
 
     public static void Log(string mensagem)
@@ -2730,8 +3343,12 @@ class App : ApplicationContext
 static class Programa
 {
     [STAThread]
-    static void Main()
+    static void Main(string[] args)
     {
+#if TESTE
+        Teste.Rodar(args);
+        return;
+#else
         bool primeiro;
         using (System.Threading.Mutex unico = new System.Threading.Mutex(true, "ClipHistoricoExe", out primeiro))
         {
@@ -2759,5 +3376,6 @@ static class Programa
             Application.Run(new App());
             GC.KeepAlive(unico);
         }
+#endif
     }
 }
