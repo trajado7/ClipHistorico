@@ -1048,6 +1048,33 @@ static class Teste
             Console.WriteLine(falhas == 0 ? "TUDO OK" : "FALHAS: " + falhas);
             Environment.Exit(falhas == 0 ? 0 : 1);
         }
+        // Desenha o emoji do icone com o motor do programa (para gerar o icone.ico)
+        if (args.Length > 2 && args[1] == "emoji")
+        {
+            foreach (int lado in new[] { 256, 64, 48, 40, 32, 24, 20, 16 })
+            {
+                float fonte = lado * float.Parse(args.Length > 3 ? args[3] : "0.72", System.Globalization.CultureInfo.InvariantCulture);
+                using (Bitmap b = EmojiCor.Criar(args[2], lado, fonte))
+                {
+                    if (b == null) { Console.WriteLine("nao desenhou " + lado); continue; }
+                    b.Save(Path.Combine(saida, "emoji" + lado + ".png"), System.Drawing.Imaging.ImageFormat.Png);
+                }
+            }
+            Environment.Exit(0);
+        }
+
+        // Gera o icone.ico do programa (o 🥋 com a faixa preta) e as previas em PNG
+        if (args.Length > 1 && args[1] == "icone")
+        {
+            byte[] ico = Tema.ArquivoIco(new[] { 16, 20, 24, 32, 40, 48, 64, 256 });
+            if (ico == null) { Console.WriteLine("nao desenhou"); Environment.Exit(1); }
+            File.WriteAllBytes(Path.Combine(saida, "icone.ico"), ico);
+            foreach (int l in new[] { 256, 32, 16 })
+                using (Bitmap b = Tema.Quimono(l)) b.Save(Path.Combine(saida, "faixa" + l + ".png"), System.Drawing.Imaging.ImageFormat.Png);
+            using (Icon i = new Icon(Path.Combine(saida, "icone.ico"), 16, 16)) Console.WriteLine("icone lido de volta: " + i.Width + "x" + i.Height);
+            Environment.Exit(0);
+        }
+
         if (args.Length > 1 && args[1] == "sincronia")
         {
             TestarSincronia(saida);

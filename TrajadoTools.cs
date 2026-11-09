@@ -399,7 +399,109 @@ static class Tema
     }
 
     // Icone roxo de prancheta, desenhado na hora
-    public static Icon CriarIcone()
+    // Icone do programa: o 🥋 do Windows com a faixa preta (lá ela vem
+    // laranja, 240,58,23). Cada pixel e uma mistura de laranja com o cinza do
+    // quimono ou do contorno: so a parte laranja vira preto, e as bordas
+    // continuam suaves.
+    public static Bitmap Quimono(int lado)
+    {
+        Bitmap b = EmojiCor.Criar(char.ConvertFromUtf32(0x1F94B), lado, lado * 0.72f);
+        if (b == null) return null;
+        Bitmap r = new Bitmap(lado, lado, PixelFormat.Format32bppArgb);
+        using (Graphics g = Graphics.FromImage(r)) g.DrawImage(b, 0, 0, lado, lado);
+        b.Dispose();
+        PintarFaixaDePreto(r);
+        return r;
+    }
+
+    public static void PintarFaixaDePreto(Bitmap b)
+    {
+        const int oR = 240, oB = 23, faixa = 18;
+        Rectangle area = new Rectangle(0, 0, b.Width, b.Height);
+        BitmapData d = b.LockBits(area, ImageLockMode.ReadWrite, PixelFormat.Format32bppArgb);
+        int[] px = new int[b.Width * b.Height];
+        Marshal.Copy(d.Scan0, px, 0, px.Length);
+        for (int i = 0; i < px.Length; i++)
+        {
+            int a = (px[i] >> 24) & 255, r = (px[i] >> 16) & 255, bl = px[i] & 255;
+            if (a == 0) continue;
+            double t = (r - bl) / (double)(oR - oB);   // quanto do pixel e laranja
+            if (t <= 0.03) continue;
+            if (t > 1) t = 1;
+            double cinza = t >= 0.999 ? 0 : (bl - t * oB) / (1 - t);
+            cinza = Math.Max(0, Math.Min(255, cinza));
+            int n = (int)Math.Round(t * faixa + (1 - t) * cinza);
+            px[i] = (a << 24) | (n << 16) | (n << 8) | n;
+        }
+        Marshal.Copy(px, 0, d.Scan0, px.Length);
+        b.UnlockBits(d);
+    }
+
+    // Arquivo .ico com varios tamanhos (256 em PNG, os outros em bitmap, que
+    // todo Windows le). null = nao deu para desenhar o emoji.
+    public static byte[] ArquivoIco(int[] lados)
+    {
+        List<byte[]> imagens = new List<byte[]>();
+        foreach (int lado in lados)
+        {
+            using (Bitmap b = Quimono(lado))
+            {
+                if (b == null) return null;
+                imagens.Add(lado >= 256 ? Png(b) : Dib(b));
+            }
+        }
+        MemoryStream ms = new MemoryStream();
+        BinaryWriter w = new BinaryWriter(ms);
+        w.Write((short)0); w.Write((short)1); w.Write((short)lados.Length);
+        int desloc = 6 + 16 * lados.Length;
+        for (int i = 0; i < lados.Length; i++)
+        {
+            byte l = (byte)(lados[i] >= 256 ? 0 : lados[i]);
+            w.Write(l); w.Write(l); w.Write((byte)0); w.Write((byte)0);
+            w.Write((short)1); w.Write((short)32);
+            w.Write(imagens[i].Length); w.Write(desloc);
+            desloc += imagens[i].Length;
+        }
+        foreach (byte[] im in imagens) w.Write(im);
+        return ms.ToArray();
+    }
+
+    static byte[] Png(Bitmap b)
+    {
+        using (MemoryStream ms = new MemoryStream()) { b.Save(ms, ImageFormat.Png); return ms.ToArray(); }
+    }
+
+    static byte[] Dib(Bitmap b)
+    {
+        int lw = b.Width, lh = b.Height;
+        MemoryStream ms = new MemoryStream();
+        BinaryWriter w = new BinaryWriter(ms);
+        w.Write(40); w.Write(lw); w.Write(lh * 2); w.Write((short)1); w.Write((short)32);
+        w.Write(0); w.Write(0); w.Write(0); w.Write(0); w.Write(0); w.Write(0);
+        for (int y = lh - 1; y >= 0; y--)
+            for (int x = 0; x < lw; x++)
+            {
+                Color c = b.GetPixel(x, y);
+                w.Write(c.B); w.Write(c.G); w.Write(c.R); w.Write(c.A);
+            }
+        int linhaMascara = (lw + 31) / 32 * 4;
+        w.Write(new byte[linhaMascara * lh]);   // a transparencia vem do alfa
+        return ms.ToArray();
+    }
+
+    public static Icon CriarIcone(int lado = 32)
+    {
+        try
+        {
+            byte[] ico = ArquivoIco(new[] { 16, 20, 24, 32, 40, 48, 64 });
+            if (ico != null) return new Icon(new MemoryStream(ico), lado, lado);
+        }
+        catch (Exception ex) { App.Log("Erro ao desenhar o icone: " + ex.Message); }
+        return IconeDesenhado();
+    }
+
+    // Sem Direct2D (Windows muito antigo): a prancheta de antes
+    static Icon IconeDesenhado()
     {
         using (Bitmap b = new Bitmap(32, 32))
         {
@@ -5100,7 +5202,7 @@ class App : ApplicationContext
         limpeza.Tick += delegate { LimparVencidos(); };
         AgendarLimpeza();
 
-        icone = Tema.CriarIcone();
+        icone = Tema.CriarIcone(SystemInformation.SmallIconSize.Width);   // perto do relogio: o tamanho pequeno
         bandeja = new NotifyIcon();
         bandeja.Icon = icone;
         bandeja.Text = TextoBandeja;
@@ -6334,8 +6436,15 @@ static class Replay
         string saida;
         lock (linhas) saida = string.Join("\n", linhas.ToArray());
         bool perdida = vigia != null && vigia.TelaPerdida;
-        App.Log("Replay " + (perdida ? "perdeu a tela" : "travou") + " (" + (vigia == null ? -1 : vigia.Quadros) + " quadros): " + saida);
-        bool rapida = (DateTime.Now - inicio).TotalSeconds < 3;   // caiu logo depois de abrir: nao insiste sem pausa
+        // Caiu logo depois de abrir: o Windows ainda esta trocando o modo da
+        // tela (leva ~1-2 s no BlueStacks). Tenta de novo a cada 0,15 s, que
+        // cada tentativa perdida e video congelado; depois de 40, espera 1 s.
+        bool rapida = (DateTime.Now - inicio).TotalSeconds < 3;
+        tentativasRapidas = rapida ? tentativasRapidas + 1 : 0;
+        if (tentativasRapidas <= 1)
+            App.Log("Replay " + (perdida ? "perdeu a tela" : "travou") + " (" + (vigia == null ? -1 : vigia.Quadros) + " quadros): " + saida);
+        else if (tentativasRapidas % 20 == 0)
+            App.Log("Replay: " + tentativasRapidas + " tentativas seguidas de voltar a capturar");
         Parar();
         // Perder a tela e normal (Alt+Tab num jogo em tela cheia): volta calado
         if (!perdida)
@@ -6345,10 +6454,12 @@ static class Replay
                 Aviso.Mostrar("Replay reiniciado", "A captura da tela travou (um jogo mudou o modo da tela?)", Tema.Suave);
             ultimoTravou = DateTime.Now;
         }
-        if (espera != null) { espera.Interval = rapida ? 1000 : 30; espera.Start(); }
+        if (espera != null) { espera.Interval = !rapida ? 30 : tentativasRapidas <= 40 ? 150 : 1000; espera.Start(); }
         Avisar();
         return true;
     }
+
+    static int tentativasRapidas;
 
 #if TESTE
     // Faz de conta que o ffmpeg escreveu o erro do ddagrab (887a0026)
