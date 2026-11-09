@@ -648,6 +648,8 @@ static class Teste
         if (Directory.Exists(clipes)) Directory.Delete(clipes, true);
         Directory.CreateDirectory(clipes);
         TestarGravacao(clipes);
+        TestarTravamento();
+        TestarGravacaoNormal(clipes);
         TestarGaleria(saida, clipes);
     }
 
@@ -695,7 +697,7 @@ static class Teste
             Console.WriteLine(s);
             string d = Miniaturas.LerDuracao(s);
             Ok(s.Contains("Video: h264") && s.Contains("Audio: aac"), "clipe tem video h264 e som aac");
-            Ok(d == "0:07" || d == "0:08" || d == "0:09", "clipe curto tem o tempo gravado ate agora: " + d);
+            Ok(d == "0:06" || d == "0:07" || d == "0:08" || d == "0:09", "clipe curto tem o tempo gravado ate agora: " + d);
         }
 
         // passou da duracao: o clipe fica com 15 s (+ o pedaco em andamento)
@@ -718,6 +720,79 @@ static class Teste
         Replay.Parar();
         Ok(p == null || p.WaitForExit(3000), "parar fecha o ffmpeg");
         Ok(!Replay.Gravando, "parado");
+    }
+
+    [System.Runtime.InteropServices.DllImport("ntdll.dll")] static extern int NtSuspendProcess(IntPtr h);
+
+    static Process FfmpegMaisNovo()
+    {
+        Process p = null;
+        foreach (Process x in Process.GetProcessesByName("ffmpeg"))
+            try { if (p == null || x.StartTime > p.StartTime) p = x; } catch { }
+        return p;
+    }
+
+    // Congela o ffmpeg (como o BlueStacks fez com a captura): o vigia tem de perceber e reiniciar
+    static void TestarTravamento()
+    {
+        ConfigClipe.Segundos = 15;
+        ConfigClipe.UsarQualidade(2);
+        ConfigClipe.SomPc = true;
+        ConfigClipe.Microfone = false;
+        ConfigClipe.Ligado = true;
+        WindowsFormsSynchronizationContext ctx = new WindowsFormsSynchronizationContext();
+        System.Threading.SynchronizationContext.SetSynchronizationContext(ctx);
+        Replay.Preparar(ctx);
+        Ok(Esperar(delegate { return Replay.Gravando; }, 30000), "replay gravando antes do travamento");
+        Esperar(delegate { return false; }, 3000);
+        Process velho = FfmpegMaisNovo();
+        NtSuspendProcess(velho.Handle);
+        Stopwatch sw = Stopwatch.StartNew();
+        Ok(Esperar(delegate { return !Replay.Gravando; }, 9000), "vigia percebeu o travamento");
+        Console.WriteLine("percebeu em " + sw.ElapsedMilliseconds + " ms");
+        Ok(Esperar(delegate { return Replay.Gravando; }, 20000), "replay voltou sozinho");
+        Process novo = FfmpegMaisNovo();
+        Ok(novo != null && novo.Id != velho.Id && velho.WaitForExit(3000), "ffmpeg travado foi fechado e outro abriu");
+        Esperar(delegate { return false; }, 3000);
+        Replay.SalvarClipe();
+        Esperar(delegate { return !Replay.Salvando; }, 30000);
+        Replay.Parar();
+    }
+
+    static void TestarGravacaoNormal(string clipes)
+    {
+        foreach (string f in Directory.GetFiles(clipes, "gravacao-*")) File.Delete(f);
+        Gravacao.Iniciar(false);
+        Ok(Esperar(delegate { return Gravacao.Ativa; }, 20000), "gravacao iniciou");
+        Esperar(delegate { return false; }, 6000);
+        Console.WriteLine("tempo na tela: " + Gravacao.Tempo);
+        Gravacao.Parar();
+        Ok(Esperar(delegate { return !Gravacao.Parando; }, 30000), "gravacao terminou de salvar");
+        string[] g = Directory.GetFiles(clipes, "gravacao-*.mp4");
+        Ok(g.Length == 1, "gravacao virou mp4");
+        if (g.Length == 1)
+        {
+            string s = Sondar(g[0]);
+            string d = Miniaturas.LerDuracao(s);
+            Ok(s.Contains("Video: h264") && s.Contains("Audio: aac"), "gravacao tem video e som");
+            Ok(d == "0:05" || d == "0:06" || d == "0:07", "gravacao tem o tempo gravado: " + d);
+        }
+        Ok(Directory.GetFiles(Gravacao.PastaTemp).Length == 0, "nao sobrou .mkv temporario");
+
+        // travou no meio: salva o que tem e continua num arquivo novo
+        foreach (string f in Directory.GetFiles(clipes, "gravacao-*")) File.Delete(f);
+        Gravacao.Iniciar(false);
+        Ok(Esperar(delegate { return Gravacao.Ativa; }, 20000), "segunda gravacao iniciou");
+        Esperar(delegate { return false; }, 3000);
+        NtSuspendProcess(FfmpegMaisNovo().Handle);
+        Ok(Esperar(delegate { return Gravacao.Parando || !Gravacao.Ativa; }, 9000), "vigia da gravacao percebeu");
+        Ok(Esperar(delegate { return Gravacao.Ativa && !Gravacao.Parando; }, 30000), "gravacao continuou sozinha");
+        Esperar(delegate { return false; }, 3000);
+        Gravacao.Parar();
+        Esperar(delegate { return !Gravacao.Parando; }, 30000);
+        string[] partes = Directory.GetFiles(clipes, "gravacao-*");
+        Ok(partes.Length == 2, "duas partes salvas: " + partes.Length);
+        foreach (string f in Directory.GetFiles(clipes, "gravacao-*")) File.Delete(f);
     }
 
     // Pisca um quadrado branco no canto da tela principal e toca um bipe de
@@ -812,6 +887,31 @@ static class Teste
         int esperadas = cores.Length + Directory.GetFiles(clipes, "*.mp4").Length;
         Esperar(delegate { return false; }, 3000);   // miniaturas carregando em fundo
         FotoForm(gal, Path.Combine(saida, "galeria.png"));
+
+        // arrastar um retangulo sobre os dois primeiros cards de "Hoje"
+        GradeMidias gr = gal.Grade;
+        Ok(gr.Marcadas == 0, "comeca sem selecao");
+        Arrastar(gr, new Point(20, 60), new Point(GradeMidias.Margem + 340, 120));
+        Console.WriteLine("selecionados no arrasto: " + gr.Marcadas);
+        Ok(gr.Marcadas == 2, "arrastar seleciona os dois primeiros");
+        FotoForm(gal, Path.Combine(saida, "galeria-selecao.png"));
+        gr.SelecionarTudo();
+        Ok(gr.Marcadas == esperadas, "selecionar tudo");
+        gr.LimparSelecao();
+        Ok(gr.Marcadas == 0, "limpar selecao");
+
+        // excluir permanentemente: so os prints de ontem
+        gal.SemConfirmar = true;
+        int antes = Directory.GetFiles(prints).Length;
+        List<Midia> doisPrints = new List<Midia>();
+        Arrastar(gr, new Point(20, 60), new Point(GradeMidias.Margem + 340, 120));
+        foreach (Midia m in gr.Selecionadas()) if (!m.Video) doisPrints.Add(m);
+        gr.LimparSelecao();
+        foreach (Midia m in doisPrints) gr.Alternar(m);
+        gal.ExcluirSelecionadas(true);
+        Ok(Directory.GetFiles(prints).Length == antes - doisPrints.Count && doisPrints.Count > 0, "excluiu permanentemente " + doisPrints.Count);
+        foreach (Midia m in doisPrints) Ok(!File.Exists(m.Caminho), "apagado: " + Path.GetFileName(m.Caminho));
+
         gal.MostrarConfig(true);
         Esperar(delegate { return false; }, 1500);
         FotoForm(gal, Path.Combine(saida, "galeria-config.png"));

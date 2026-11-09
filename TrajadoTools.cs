@@ -1,6 +1,6 @@
 // =====================================================================
-//  ClipHistorico.cs
-//  Area de transferencia turbinada para Windows
+//  TrajadoTools.cs  (Trajado Tools; ate a versao 1.6 se chamava ClipHistorico)
+//  Area de transferencia, prints, clipes e gravacao de tela para Windows
 //
 //  Abas: Historico (textos e imagens copiados), Salvos (seus textos fixos)
 //  e Emotes coloridos (com busca em portugues, como o Win + . do Windows).
@@ -14,6 +14,7 @@
 //    Alt + Z ............ galeria de prints e clipes (como a da NVIDIA)
 //    Alt + F10 .......... salvar os ultimos segundos da tela (replay)
 //    Alt + Shift + F10 .. ligar ou desligar o replay
+//    Alt + F9 ........... iniciar ou parar a gravacao da tela
 //
 //  Compilar: rode o compilar.bat (usa o compilador do proprio Windows).
 //  Escrito em C# 5 para funcionar com o csc.exe do .NET Framework 4.
@@ -114,14 +115,40 @@ static class Config
     public const int TextoEmMemoria = 4096;   // textos maiores ficam so no disco
     public const int MaxRecentes    = 32;     // emotes recentes
 
+    public const string Nome = "Trajado Tools";
+
     // Pastas
-    public static readonly string Pasta = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "ClipHistorico");      // historico
+    public static readonly string Pasta = PastaDoApp(Environment.SpecialFolder.UserProfile);        // historico
     public static readonly string PastaPrints = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "PRINTS");            // prints
-    public static readonly string PastaDados = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "ClipHistorico"); // config, salvos, recentes
-                                                                                                // (o "Limpar tudo" nao mexe aqui)
+    public static readonly string PastaDados = PastaDoApp(Environment.SpecialFolder.ApplicationData); // config, salvos, recentes
+                                                                                                    // (o "Limpar tudo" nao mexe aqui)
+
+    // O app se chamava ClipHistorico: na primeira abertura a pasta antiga vira
+    // TrajadoTools (renomear na mesma unidade e instantaneo e nao copia nada).
+    // Se nao der (arquivo aberto), continua usando a antiga.
+    public static string PastaDoApp(Environment.SpecialFolder raiz)
+    {
+        string b = Environment.GetFolderPath(raiz);
+        string nova = Path.Combine(b, "TrajadoTools"), velha = Path.Combine(b, "ClipHistorico");
+        if (Directory.Exists(nova) || !Directory.Exists(velha)) return nova;
+#if TESTE
+        return velha;   // os testes nunca mexem nas pastas de verdade
+#else
+        try { Directory.Move(velha, nova); return nova; }
+        catch { return velha; }
+#endif
+    }
+
+    // null = pode usar; senao, o motivo
+    public static string ProblemaDoAtalho(int i, Atalho a)
+    {
+        if ((a.Mods & ~Atalho.Shift) == 0 && !Atalho.PodeSozinha(a.Vk))
+            return "Use junto com Ctrl, Alt ou Win (ex.: Ctrl + Alt + " + Atalho.NomeTecla(a.Vk) + ").";
+        for (int j = 0; j < Atalhos.Length; j++)
+            if (j != i && Atalhos[j].Igual(a)) return a + " já está em: " + NomesAcoes[j];
+        return null;
+    }
     // Opcoes (mudam pela engrenagem)
     public static bool ColarAuto     = false;
     public static bool SomAoCapturar = true;
@@ -133,7 +160,7 @@ static class Config
 
     // Acoes que tem atalho
     public const int AbrirHistorico = 0, AbrirEmotes = 1, PrintJanela = 2, PrintTela = 3, RecortarTela = 4,
-                     AbrirGaleria = 5, SalvarClipe = 6, AlternarReplay = 7;
+                     AbrirGaleria = 5, SalvarClipe = 6, AlternarReplay = 7, Gravar = 8;
 
     public static readonly string[] NomesAcoes =
     {
@@ -144,7 +171,8 @@ static class Config
         "Recortar parte da tela",
         "Galeria de prints e clipes",
         "Salvar clipe (replay)",
-        "Ligar ou desligar o replay"
+        "Ligar ou desligar o replay",
+        "Iniciar ou parar a gravação"
     };
 
     public static readonly Atalho[] Padrao =
@@ -156,7 +184,8 @@ static class Config
         new Atalho(Atalho.Win | Atalho.Shift, 0x53),  // Win + Shift + S
         new Atalho(Atalho.Alt, 0x5A),                 // Alt + Z
         new Atalho(Atalho.Alt, 0x79),                 // Alt + F10
-        new Atalho(Atalho.Alt | Atalho.Shift, 0x79)   // Alt + Shift + F10
+        new Atalho(Atalho.Alt | Atalho.Shift, 0x79),  // Alt + Shift + F10
+        new Atalho(Atalho.Alt, 0x78)                  // Alt + F9
     };
 
     public static Atalho[] Atalhos = (Atalho[])Padrao.Clone();
@@ -2269,7 +2298,7 @@ class Janela : Form
         Padding         = new Padding(1);
         TopMost         = true;
         ShowInTaskbar   = false;
-        Text            = "\u00c1rea de transfer\u00eancia";
+        Text            = Config.Nome;
 
         Rectangle tela = Screen.FromPoint(System.Windows.Forms.Cursor.Position).WorkingArea;
         Location = new Point(tela.X + (tela.Width - Width) / 2, tela.Y + (tela.Height - Height) / 2);
@@ -5023,8 +5052,9 @@ class EditorImagem : Form
 class App : ApplicationContext
 {
     const string ChaveIniciar = @"Software\Microsoft\Windows\CurrentVersion\Run";
-    const string NomeIniciar  = "ClipHistorico";
-    static readonly string TextoBandeja = "\u00c1rea de transfer\u00eancia";
+    const string NomeIniciar  = "TrajadoTools";
+    const string NomeAntigo   = "ClipHistorico";
+    static readonly string TextoBandeja = Config.Nome;
 
     readonly Nucleo nucleo;
     readonly NotifyIcon bandeja;
@@ -5081,7 +5111,9 @@ class App : ApplicationContext
 
         // Replay instantaneo: comeca a gravar em fundo, se estiver ligado
         ConfigClipe.Carregar();
+        Gravacao.Recuperar();
         Replay.Preparar(contexto);
+        MigrarIniciar();
 
         Aparar();
     }
@@ -5126,7 +5158,14 @@ class App : ApplicationContext
 
         ToolStripMenuItem replay = new ToolStripMenuItem("Replay instantâneo");
         replay.Click += delegate { Replay.DefinirLigado(!ConfigClipe.Ligado); };
-        menu.Opening += delegate { replay.Checked = ConfigClipe.Ligado; };
+
+        ToolStripMenuItem gravar = new ToolStripMenuItem("Iniciar gravação");
+        gravar.Click += delegate { Gravacao.Alternar(); };
+        menu.Opening += delegate
+        {
+            replay.Checked = ConfigClipe.Ligado;
+            gravar.Text = Gravacao.Ativa ? "Parar gravação (" + Gravacao.Tempo + ")" : "Iniciar gravação";
+        };
 
         ToolStripMenuItem limpar = new ToolStripMenuItem("Limpar hist\u00f3rico");
         limpar.Click += delegate
@@ -5144,7 +5183,7 @@ class App : ApplicationContext
 
         menu.Items.AddRange(new ToolStripItem[] {
             abrir, salvos, emotes, recortar, config, new ToolStripSeparator(),
-            galeria, salvarClipe, replay, new ToolStripSeparator(),
+            galeria, salvarClipe, gravar, replay, new ToolStripSeparator(),
             pausar, pasta, new ToolStripSeparator(), limpar, sair });
         return menu;
     }
@@ -5162,6 +5201,7 @@ class App : ApplicationContext
             case Config.AbrirGaleria:   AlternarGaleria(); break;
             case Config.SalvarClipe:    Replay.SalvarClipe(); break;
             case Config.AlternarReplay: Replay.DefinirLigado(!ConfigClipe.Ligado); break;
+            case Config.Gravar:         Gravacao.Alternar(); break;
         }
     }
 
@@ -5170,7 +5210,7 @@ class App : ApplicationContext
     {
         if (Galeria.Atual != null) { Galeria.Atual.Close(); return; }
         if (janela != null) janela.Fechar();
-        try { new Galeria().Mostrar(); }
+        try { new Galeria(nucleo).Mostrar(); }
         catch (Exception ex) { Log("Erro ao abrir a galeria: " + ex); }
     }
 
@@ -5505,6 +5545,23 @@ class App : ApplicationContext
         catch { return false; }
     }
 
+    // Troca a entrada antiga (ClipHistorico) pela nova e aponta para o .exe
+    // atual, que mudou de nome e de pasta
+    static void MigrarIniciar()
+    {
+        try
+        {
+            using (RegistryKey k = Registry.CurrentUser.OpenSubKey(ChaveIniciar, true))
+            {
+                if (k == null) return;
+                bool ligado = k.GetValue(NomeAntigo) != null || k.GetValue(NomeIniciar) != null;
+                k.DeleteValue(NomeAntigo, false);
+                if (ligado) k.SetValue(NomeIniciar, "\"" + Application.ExecutablePath + "\"");
+            }
+        }
+        catch (Exception ex) { Log("Erro ao atualizar a inicializacao: " + ex.Message); }
+    }
+
     public static void DefinirIniciar(bool ligar)
     {
         try
@@ -5564,6 +5621,7 @@ class App : ApplicationContext
         if (janela != null) janela.Close();
         if (Galeria.Atual != null) Galeria.Atual.Close();
         Replay.Parar();
+        Gravacao.ParaSair();
         repetir.Dispose();
         limpeza.Dispose();
         bandeja.Visible = false;
@@ -5612,8 +5670,7 @@ static class ConfigClipe
         get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyVideos), "CLIPES"); }
     }
 
-    static readonly string Local = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ClipHistorico");
+    public static readonly string Local = Config.PastaDoApp(Environment.SpecialFolder.LocalApplicationData);
     public static readonly string PastaAnel       = Path.Combine(Local, "replay");
     public static readonly string PastaMiniaturas = Path.Combine(Local, "miniaturas");
 
@@ -5708,8 +5765,7 @@ static class ConfigClipe
 // Onde esta o ffmpeg, rodar e baixar
 static class Ffmpeg
 {
-    public static readonly string PastaPropria = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ClipHistorico", "ffmpeg");
+    public static readonly string PastaPropria = Path.Combine(ConfigClipe.Local, "ffmpeg");
     const string Endereco = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
     static string achado;
 
@@ -5750,6 +5806,21 @@ static class Ffmpeg
         i.StandardErrorEncoding = Encoding.UTF8;
         if (pasta != null) i.WorkingDirectory = pasta;
         return i;
+    }
+
+    // Para gravacoes longas: o ffmpeg conta os quadros a cada segundo na
+    // saida padrao ("-progress pipe:1"). Se a conta parar, a captura travou
+    // sem o ffmpeg fechar: aconteceu com o BlueStacks mudando o modo da tela.
+    public const string ArgsProgresso = "-progress pipe:1 -stats_period 1 ";
+
+    public static void Vigiar(Process p, Vigia v)
+    {
+        p.StartInfo.RedirectStandardOutput = true;
+        p.OutputDataReceived += delegate(object s, DataReceivedEventArgs e)
+        {
+            long n;
+            if (e.Data != null && e.Data.StartsWith("frame=") && long.TryParse(e.Data.Substring(6), out n)) v.Quadro(n);
+        };
     }
 
     // Roda e espera. Devolve o codigo de saida (-1 = passou do tempo, -2 = sem ffmpeg).
@@ -5849,6 +5920,26 @@ static class Ffmpeg
         t.IsBackground = true;
         t.Start();
     }
+}
+
+// Ultima vez que a captura andou (thread-safe)
+class Vigia
+{
+    static readonly Stopwatch relogio = Stopwatch.StartNew();
+    long quadros = -1, quando = relogio.ElapsedMilliseconds;
+
+    public void Quadro(long n)
+    {
+        if (n != Interlocked.Read(ref quadros))
+        {
+            Interlocked.Exchange(ref quadros, n);
+            Interlocked.Exchange(ref quando, relogio.ElapsedMilliseconds);
+        }
+    }
+
+    // ms desde o ultimo quadro novo (conta desde a criacao, para dar tempo de iniciar)
+    public long Parado { get { return relogio.ElapsedMilliseconds - Interlocked.Read(ref quando); } }
+    public long Quadros { get { return Interlocked.Read(ref quadros); } }
 }
 
 // Se o programa fechar ou cair, o Windows fecha o ffmpeg junto
@@ -6167,7 +6258,10 @@ static class Replay
     public static int ProgressoDownload = -1;
 
     static SynchronizationContext ui;
-    static Timer espera, reconfigurar;
+    static Timer espera, reconfigurar, vigiar;
+    static Vigia vigia;
+    static DateTime ultimoTravou;
+    public const int TravadoMs = 5000;   // sem quadro novo por esse tempo = captura travada
     static Process proc, morrendo;
     static SomCaptura somPc, somMic;
     static int geracao, falhas, anel;
@@ -6189,14 +6283,62 @@ static class Replay
             reconfigurar.Stop();
             if (ConfigClipe.Ligado) { falhas = 0; Iniciar(); }
         };
+        vigiar = new Timer();
+        vigiar.Interval = 1000;
+        vigiar.Tick += delegate
+        {
+            if (Gravando && vigia != null && vigia.Parado > TravadoMs) Travou();
+            Gravacao.Vigiar();
+        };
+        vigiar.Start();
         if (ConfigClipe.Ligado) Iniciar();
     }
 
-    static void Avisar() { if (Mudou != null) Mudou(); }
+    // A captura parou sem o ffmpeg fechar: reinicia na hora (o anel recomeca)
+    static bool Travou()
+    {
+        string saida;
+        lock (linhas) saida = string.Join("\n", linhas.ToArray());
+        App.Log("Replay travou (" + (vigia == null ? -1 : vigia.Quadros) + " quadros): " + saida);
+        Parar();
+        Problema = "a captura da tela travou e foi reiniciada";
+        if ((DateTime.Now - ultimoTravou).TotalSeconds > 60)
+            Aviso.Mostrar("Replay reiniciado", "A captura da tela travou (um jogo mudou o modo da tela?)", Tema.Suave);
+        ultimoTravou = DateTime.Now;
+        if (espera != null) { espera.Interval = 1000; espera.Start(); }
+        Avisar();
+        return true;
+    }
 
-    static void NaJanela(SendOrPostCallback f)
+    static void Avisar() { if (Mudou != null) Mudou(); }
+    public static void Notificar() { Avisar(); }   // a gravacao tambem avisa a galeria
+
+    public static void NaJanela(SendOrPostCallback f)
     {
         try { if (ui != null) ui.Post(f, null); } catch { }
+    }
+
+    // Configuracao atual, lida na thread da janela
+    public static Opcoes OpcoesAtuais()
+    {
+        Opcoes o = new Opcoes();
+        o.Fps = ConfigClipe.Fps;
+        o.Altura = ConfigClipe.Altura;
+        o.Mbps = ConfigClipe.Mbps;
+        o.Segundos = ConfigClipe.Segundos;
+        o.MostrarCursor = ConfigClipe.MostrarCursor;
+        o.Codec = ConfigClipe.Codec;
+        return o;
+    }
+
+    // null = sem som (o video segue, mudo)
+    public static SomCaptura AbrirSom(bool microfone, string nome)
+    {
+        SomCaptura s = new SomCaptura(microfone, nome);
+        if (s.Esperar(3000)) return s;
+        App.Log((microfone ? "Microfone" : "Som do PC") + " indisponível: " + s.Erro);
+        s.Dispose();
+        return null;
     }
 
     public static string StatusLongo
@@ -6249,6 +6391,7 @@ static class Replay
             morrendo = proc;
             proc = null;
         }
+        vigia = null;
         Soltar(ref somPc);
         Soltar(ref somMic);
         Gravando = false;
@@ -6278,13 +6421,7 @@ static class Replay
         Avisar();
 
         // A configuracao e lida aqui, na thread da janela
-        Opcoes o = new Opcoes();
-        o.Fps = ConfigClipe.Fps;
-        o.Altura = ConfigClipe.Altura;
-        o.Mbps = ConfigClipe.Mbps;
-        o.Segundos = ConfigClipe.Segundos;
-        o.MostrarCursor = ConfigClipe.MostrarCursor;
-        o.Codec = ConfigClipe.Codec;
+        Opcoes o = OpcoesAtuais();
         Screen tela = MonitorEscolhido();
         bool pc = ConfigClipe.SomPc, mic = ConfigClipe.Microfone;
         Process velho = morrendo;
@@ -6316,21 +6453,15 @@ static class Replay
                 try { File.Delete(f); } catch { }
 
             int pid = Process.GetCurrentProcess().Id;
-            if (comPc)
-            {
-                pc = new SomCaptura(false, "ClipHistorico-pc-" + pid + "-" + g);
-                if (!pc.Esperar(3000)) { App.Log("Som do PC indisponível: " + pc.Erro); pc.Dispose(); pc = null; }
-            }
-            if (comMic)
-            {
-                mic = new SomCaptura(true, "ClipHistorico-mic-" + pid + "-" + g);
-                if (!mic.Esperar(3000)) { App.Log("Microfone indisponível: " + mic.Erro); mic.Dispose(); mic = null; }
-            }
+            if (comPc) pc = AbrirSom(false, "TrajadoTools-pc-" + pid + "-" + g);
+            if (comMic) mic = AbrirSom(true, "TrajadoTools-mic-" + pid + "-" + g);
 
-            string args = MontarArgs(o, pc == null ? null : pc.Entrada, mic == null ? null : mic.Entrada);
+            string args = Ffmpeg.ArgsProgresso + MontarArgs(o, pc == null ? null : pc.Entrada, mic == null ? null : mic.Entrada);
             lock (linhas) linhas.Clear();
             Process p = new Process();
             p.StartInfo = Ffmpeg.Info(args, ConfigClipe.PastaAnel);
+            Vigia v = new Vigia();
+            Ffmpeg.Vigiar(p, v);
             p.EnableRaisingEvents = true;
             p.ErrorDataReceived += delegate(object s, DataReceivedEventArgs e)
             {
@@ -6342,6 +6473,7 @@ static class Replay
             Trabalho.Prender(p);
             try { p.PriorityClass = ProcessPriorityClass.AboveNormal; } catch { }
             p.BeginErrorReadLine();
+            p.BeginOutputReadLine();
 
             Rectangle b = tela.Bounds;
             string desc = (o.Altura == 0 ? b.Width + " × " + b.Height : o.Altura + "p") + Tema.Ponto + o.Fps + " FPS" +
@@ -6360,6 +6492,7 @@ static class Replay
                     return;
                 }
                 proc = p;
+                vigia = v;
                 somPc = pcF;
                 somMic = micF;
                 Codificador = o.Codificador;
@@ -6447,7 +6580,7 @@ static class Replay
         return "processador (x264)";
     }
 
-    static string Escolher(string codec, int monitor)
+    public static string Escolher(string codec, int monitor)
     {
         foreach (string c in Candidatos(codec))
             if (Testar(c, monitor)) return c;
@@ -6521,9 +6654,11 @@ static class Replay
         return "-c:v " + e + " -preset veryfast " + taxa + g;
     }
 
-    public static string MontarArgs(Opcoes o, string entradaPc, string entradaMic)
+    // Captura e codificacao; o replay e a gravacao so mudam a saida.
+    // comTeclado = o ffmpeg le o "q" para terminar o arquivo direito.
+    public static string ArgsCaptura(Opcoes o, string entradaPc, string entradaMic, bool comTeclado)
     {
-        StringBuilder a = new StringBuilder("-hide_banner -loglevel error -nostdin -y ");
+        StringBuilder a = new StringBuilder("-hide_banner -loglevel error " + (comTeclado ? "" : "-nostdin ") + "-y ");
         a.Append("-f lavfi -i ddagrab=output_idx=").Append(o.Monitor).Append(":framerate=").Append(o.Fps)
          .Append(":draw_mouse=").Append(o.MostrarCursor ? 1 : 0).Append(' ');
         if (entradaPc != null) a.Append(entradaPc).Append(' ');
@@ -6536,8 +6671,14 @@ static class Replay
         else if (entradaPc != null || entradaMic != null)
             a.Append("-map 1:a ");
         a.Append(ArgsCodificador(o));
-        a.Append("-force_key_frames \"expr:gte(t,n_forced*1)\" ");
         if (entradaPc != null || entradaMic != null) a.Append("-c:a aac -b:a 192k -ac 2 -ar 48000 ");
+        return a.ToString();
+    }
+
+    public static string MontarArgs(Opcoes o, string entradaPc, string entradaMic)
+    {
+        StringBuilder a = new StringBuilder(ArgsCaptura(o, entradaPc, entradaMic, false));
+        a.Append("-force_key_frames \"expr:gte(t,n_forced*1)\" ");
         int n = o.Segundos + Folga;
         a.Append("-f segment -segment_time 1 -segment_wrap ").Append(n)
          .Append(" -segment_list lista.csv -segment_list_type csv -segment_list_size ").Append(n)
@@ -6593,12 +6734,12 @@ static class Replay
         return nomes;
     }
 
-    public static string CaminhoNovo()
+    public static string CaminhoNovo(string prefixo = "clipe-", string ext = ".mp4")
     {
         Directory.CreateDirectory(ConfigClipe.Pasta);
-        string b = "clipe-" + DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
-        string arq = Path.Combine(ConfigClipe.Pasta, b + ".mp4");
-        for (int n = 2; File.Exists(arq); n++) arq = Path.Combine(ConfigClipe.Pasta, b + "_" + n + ".mp4");
+        string b = prefixo + DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
+        string arq = Path.Combine(ConfigClipe.Pasta, b + ext);
+        for (int n = 2; File.Exists(arq); n++) arq = Path.Combine(ConfigClipe.Pasta, b + "_" + n + ext);
         return arq;
     }
 
@@ -6622,6 +6763,15 @@ static class Replay
             return;
         }
         if (Salvando) return;
+
+        // Travada, o anel so tem imagem velha: salvar daria um clipe de minutos atras
+        if (vigia != null && vigia.Parado > 2500)
+        {
+            Travou();
+            Aviso.Mostrar("A captura da tela tinha travado",
+                "O replay reiniciou agora. Os segundos anteriores não foram gravados.", Tema.Perigo);
+            return;
+        }
 
         List<string> pedacos = EscolherPedacos(ConfigClipe.PastaAnel, SegundosAtuais, anel);
         if (pedacos.Count == 0)
@@ -6792,6 +6942,322 @@ static class Miniaturas
     }
 }
 
+// Gravacao normal (Alt + F9): grava ate parar. Vai para um .mkv (que continua
+// tocavel se o PC desligar no meio) e, ao parar, vira .mp4 sem recodificar.
+static class Gravacao
+{
+    public static bool Ativa, Iniciando, Parando;
+    public static DateTime Inicio;
+    public static readonly string PastaTemp = Path.Combine(ConfigClipe.Local, "gravando");
+
+    static Process proc;
+    static Vigia vigia;
+    static SomCaptura pc, mic;
+    static string arquivo, codificador;
+    static int geracao;
+    static Indicador indicador;
+    static readonly List<string> linhas = new List<string>();
+
+    public static string Tempo
+    {
+        get
+        {
+            TimeSpan t = DateTime.Now - Inicio;
+            return t.TotalHours >= 1 ? (int)t.TotalHours + ":" + t.Minutes.ToString("00") + ":" + t.Seconds.ToString("00")
+                                     : (int)t.TotalMinutes + ":" + t.Seconds.ToString("00");
+        }
+    }
+
+    public static void Alternar()
+    {
+        if (Ativa) Parar();
+        else if (!Iniciando && !Parando) Iniciar(false);
+    }
+
+    public static void Iniciar(bool continuacao)
+    {
+        if (Ativa || Iniciando || Parando) return;
+        if (Ffmpeg.Caminho == null)
+        {
+            Aviso.Mostrar("Falta o ffmpeg", "Baixe nas configurações da galeria (" + Config.Atalhos[Config.AbrirGaleria] + ")", Tema.Perigo);
+            return;
+        }
+        Iniciando = true;
+        Replay.Notificar();
+        Replay.Opcoes o = Replay.OpcoesAtuais();
+        Screen tela = Replay.MonitorEscolhido();
+        bool comPc = ConfigClipe.SomPc, comMic = ConfigClipe.Microfone;
+        int g = ++geracao;
+
+        Thread t = new Thread(delegate()
+        {
+            SomCaptura a = null, m = null;
+            try
+            {
+                o.Monitor = Math.Max(0, Dxgi.IndiceDoMonitor(tela.DeviceName));
+                o.Codificador = Replay.Escolher(o.Codec, o.Monitor);
+                if (o.Codificador == null) throw new Exception("a placa de vídeo não aceitou " + Replay.NomeCodec(o.Codec));
+                Directory.CreateDirectory(PastaTemp);
+                string arq = Path.Combine(PastaTemp, "gravacao-" + DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss") + ".mkv");
+                int pid = Process.GetCurrentProcess().Id;
+                if (comPc) a = Replay.AbrirSom(false, "TrajadoTools-gpc-" + pid + "-" + g);
+                if (comMic) m = Replay.AbrirSom(true, "TrajadoTools-gmic-" + pid + "-" + g);
+
+                string args = Ffmpeg.ArgsProgresso + Replay.ArgsCaptura(o, a == null ? null : a.Entrada, m == null ? null : m.Entrada, true) +
+                              "-f matroska " + Ffmpeg.Aspas(arq);
+                lock (linhas) linhas.Clear();
+                Process p = new Process();
+                p.StartInfo = Ffmpeg.Info(args, PastaTemp);
+                p.StartInfo.RedirectStandardInput = true;
+                Vigia v = new Vigia();
+                Ffmpeg.Vigiar(p, v);
+                p.EnableRaisingEvents = true;
+                p.ErrorDataReceived += delegate(object s, DataReceivedEventArgs e)
+                {
+                    if (string.IsNullOrEmpty(e.Data)) return;
+                    lock (linhas) { linhas.Add(e.Data); if (linhas.Count > 12) linhas.RemoveAt(0); }
+                };
+                p.Exited += delegate { Replay.NaJanela(delegate { Caiu(g, p, null); }); };
+                p.Start();
+                Trabalho.Prender(p);
+                try { p.PriorityClass = ProcessPriorityClass.AboveNormal; } catch { }
+                p.BeginErrorReadLine();
+                p.BeginOutputReadLine();
+
+                SomCaptura af = a, mf = m;
+                a = null;
+                m = null;
+                Replay.NaJanela(delegate
+                {
+                    proc = p;
+                    vigia = v;
+                    pc = af;
+                    mic = mf;
+                    arquivo = arq;
+                    codificador = o.Codificador;
+                    Iniciando = false;
+                    Ativa = true;
+                    if (!continuacao) Inicio = DateTime.Now;
+                    if (p.HasExited) { Caiu(g, p, null); return; }
+                    if (indicador == null) { indicador = new Indicador(tela.Bounds); indicador.Show(); }
+                    if (!continuacao)
+                        Aviso.Mostrar("Gravação iniciada", Config.Atalhos[Config.Gravar] + " para parar", Tema.Perigo);
+                    Replay.Notificar();
+                });
+            }
+            catch (Exception ex)
+            {
+                if (a != null) a.Dispose();
+                if (m != null) m.Dispose();
+                App.Log("Erro ao iniciar a gravacao: " + ex);
+                Replay.NaJanela(delegate
+                {
+                    Iniciando = false;
+                    FecharIndicador();
+                    Aviso.Mostrar("Não deu para gravar", ex.Message, Tema.Perigo);
+                    Replay.Notificar();
+                });
+            }
+        });
+        t.IsBackground = true;
+        t.Start();
+    }
+
+    // Chamado a cada segundo pelo replay
+    public static void Vigiar()
+    {
+        if (indicador != null) indicador.Invalidate();
+        if (Ativa) Replay.Notificar();   // tempo na galeria
+        if (Ativa && vigia != null && vigia.Parado > Replay.TravadoMs) Caiu(geracao, proc, "a captura da tela travou");
+    }
+
+    public static void Parar() { Encerrar(null, false); }
+
+    // O ffmpeg fechou ou travou no meio: salva o que tem e, se travou, continua num arquivo novo
+    static void Caiu(int g, Process p, string travou)
+    {
+        if (g != geracao || proc != p || !Ativa) return;
+        string saida;
+        lock (linhas) saida = string.Join("\n", linhas.ToArray());
+        App.Log("Gravacao interrompida (" + (travou ?? "ffmpeg fechou") + "): " + saida);
+        Encerrar(travou ?? Ffmpeg.Resumo(saida) ?? "o ffmpeg fechou", travou != null);
+    }
+
+    static void Encerrar(string motivo, bool continuar)
+    {
+        if (!Ativa) return;
+        geracao++;
+        Ativa = false;
+        Parando = true;
+        Process p = proc;
+        SomCaptura a = pc, m = mic;
+        string arq = arquivo, enc = codificador;
+        proc = null; vigia = null; pc = null; mic = null;
+        if (!continuar) FecharIndicador();
+        Replay.Notificar();
+
+        // Nao e de fundo: sair do programa no meio nao perde a gravacao
+        Thread t = new Thread(delegate()
+        {
+            Terminar(p, a, m);
+            string destino, info;
+            bool ok = Finalizar(arq, enc, out destino, out info);
+            Replay.NaJanela(delegate
+            {
+                Parando = false;
+                if (continuar && motivo != null)
+                {
+                    Aviso.Mostrar("A captura travou", "O que foi gravado está salvo; a gravação continua num arquivo novo", Tema.Suave);
+                    Iniciar(true);
+                }
+                else if (ok)
+                {
+                    if (Config.SomAoCapturar) Som.Tocar();
+                    Aviso.Mostrar(motivo == null ? "Gravação salva" : "Gravação interrompida: " + motivo, info, motivo == null ? Tema.Sucesso : Tema.Perigo);
+                }
+                else Aviso.Mostrar("Não deu para salvar a gravação", info, Tema.Perigo);
+                if (Galeria.Atual != null) Galeria.Atual.Recarregar();
+                Replay.Notificar();
+            });
+        });
+        t.Start();
+    }
+
+    // "q" faz o ffmpeg fechar o arquivo direito
+    static void Terminar(Process p, SomCaptura a, SomCaptura m)
+    {
+        if (p != null)
+        {
+            try { if (!p.HasExited) { p.StandardInput.Write("q"); p.StandardInput.Flush(); } } catch { }
+            try { if (!p.WaitForExit(15000)) p.Kill(); } catch { }
+        }
+        if (a != null) a.Dispose();
+        if (m != null) m.Dispose();
+    }
+
+    // .mkv -> .mp4 na pasta dos clipes. Se nao der, o .mkv vai para la como esta.
+    static bool Finalizar(string arq, string enc, out string destino, out string info)
+    {
+        destino = null;
+        info = "";
+        try
+        {
+            if (arq == null || !File.Exists(arq) || new FileInfo(arq).Length == 0)
+            {
+                info = "nada foi gravado";
+                try { if (arq != null) File.Delete(arq); } catch { }
+                return false;
+            }
+            destino = Replay.CaminhoNovo("gravacao-");
+            bool hevc = enc != null && enc.StartsWith("hevc");
+            string saida;
+            int cod = Ffmpeg.Rodar("-hide_banner -loglevel error -nostdin -y -i " + Ffmpeg.Aspas(arq) + " -map 0 -c copy " +
+                                   (hevc ? "-tag:v hvc1 " : "") + "-movflags +faststart " + Ffmpeg.Aspas(destino), null, 600000, out saida);
+            if (cod == 0 && File.Exists(destino) && new FileInfo(destino).Length > 0) File.Delete(arq);
+            else
+            {
+                App.Log("Erro ao converter a gravacao (" + cod + "): " + saida);
+                try { if (File.Exists(destino)) File.Delete(destino); } catch { }
+                destino = Replay.CaminhoNovo("gravacao-", ".mkv");
+                File.Move(arq, destino);
+            }
+            string dur;
+            try { Bitmap b = Miniaturas.Ler(destino, true, out dur); if (b != null) b.Dispose(); } catch { dur = null; }
+            info = (dur != null ? dur + Tema.Ponto : "") + Replay.Tamanho(new FileInfo(destino).Length) + Tema.Ponto + Path.GetFileName(destino);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            App.Log("Erro ao finalizar a gravacao: " + ex);
+            info = ex.Message;
+            return false;
+        }
+    }
+
+    // O app fechou ou caiu no meio de uma gravacao: o .mkv vai para a pasta dos clipes
+    public static void Recuperar()
+    {
+        try
+        {
+            if (!Directory.Exists(PastaTemp)) return;
+            foreach (string f in Directory.GetFiles(PastaTemp, "*.mkv"))
+            {
+                if (new FileInfo(f).Length == 0) { File.Delete(f); continue; }
+                Directory.CreateDirectory(ConfigClipe.Pasta);
+                string d = Path.Combine(ConfigClipe.Pasta, Path.GetFileName(f));
+                for (int n = 2; File.Exists(d); n++) d = Path.Combine(ConfigClipe.Pasta, Path.GetFileNameWithoutExtension(f) + "_" + n + ".mkv");
+                File.Move(f, d);
+            }
+        }
+        catch (Exception ex) { App.Log("Erro ao recuperar gravacao: " + ex.Message); }
+    }
+
+    // Saindo do programa: fecha o arquivo e deixa para o Recuperar da proxima vez
+    public static void ParaSair()
+    {
+        FecharIndicador();
+        if (!Ativa) return;
+        Ativa = false;
+        geracao++;
+        Terminar(proc, pc, mic);
+        proc = null; pc = null; mic = null;
+        Recuperar();
+    }
+
+    static void FecharIndicador()
+    {
+        if (indicador != null) { indicador.Close(); indicador = null; }
+    }
+}
+
+// Janelas que nao devem aparecer nos clipes, gravacoes e prints (Windows 10 2004+)
+static class Capturas
+{
+    [DllImport("user32.dll")] static extern bool SetWindowDisplayAffinity(IntPtr h, uint afinidade);
+    public static void Esconder(IntPtr h)
+    {
+        try { SetWindowDisplayAffinity(h, 0x11); } catch { }   // WDA_EXCLUDEFROMCAPTURE
+    }
+}
+
+// "● REC 1:23" no canto do monitor gravado; nao sai na gravacao
+class Indicador : Form
+{
+    public Indicador(Rectangle tela)
+    {
+        FormBorderStyle = FormBorderStyle.None;
+        StartPosition = FormStartPosition.Manual;
+        ShowInTaskbar = false;
+        BackColor = Color.FromArgb(18, 18, 22);
+        SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint, true);
+        Size = new Size(112, 32);
+        Location = new Point(tela.Right - Width - 24, tela.Top + 24);
+    }
+
+    protected override bool ShowWithoutActivation { get { return true; } }
+
+    protected override CreateParams CreateParams
+    {
+        get
+        {
+            CreateParams cp = base.CreateParams;
+            cp.ExStyle |= 0x08000000 | 0x80 | 0x20 | 0x8;
+            return cp;
+        }
+    }
+
+    protected override void OnHandleCreated(EventArgs e) { base.OnHandleCreated(e); Capturas.Esconder(Handle); }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        Graphics g = e.Graphics;
+        g.Clear(BackColor);
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        g.FillEllipse(Tema.Pincel(Color.FromArgb(235, 60, 60)), 12, 10, 12, 12);
+        TextRenderer.DrawText(g, "REC  " + Gravacao.Tempo, Tema.Negrito, new Rectangle(30, 0, Width - 34, Height), Tema.Texto, Tema.Linha);
+    }
+}
+
 // Aviso no canto da tela, como o da NVIDIA. Nao rouba o foco do jogo e o
 // mouse passa por ele.
 class Aviso : Form
@@ -6816,7 +7282,7 @@ class Aviso : Form
         Size = new Size(Math.Max(300, Math.Min(560, w)), 70);
         IntPtr frente = Nativo.GetForegroundWindow();
         Rectangle tela = frente != IntPtr.Zero ? Screen.FromHandle(frente).Bounds : Screen.PrimaryScreen.Bounds;
-        Location = new Point(tela.Right - Width - 24, tela.Top + 24);
+        Location = new Point(tela.Right - Width - 24, tela.Top + (Gravacao.Ativa || Gravacao.Iniciando ? 68 : 24));
 
         fim = new Timer();
         fim.Interval = 3500;
@@ -6834,6 +7300,9 @@ class Aviso : Form
             return cp;
         }
     }
+
+    // Nao sai nos clipes e gravacoes
+    protected override void OnHandleCreated(EventArgs e) { base.OnHandleCreated(e); Capturas.Esconder(Handle); }
 
     protected override void OnPaint(PaintEventArgs e)
     {
@@ -6972,7 +7441,11 @@ class Midia
     public string Duracao;
     public Bitmap Mini;
     public bool Pedida;
+    public bool Marcada;      // selecionada
     public Rectangle Caixa;   // posicao na grade, sem a rolagem
+
+    public bool Gravacao { get { return Video && Path.GetFileName(Caminho).StartsWith("gravacao-", StringComparison.OrdinalIgnoreCase); } }
+    public string Tipo { get { return !Video ? "Print" : Gravacao ? "Gravação" : "Clipe"; } }
 }
 
 // Grade de miniaturas agrupada por dia. So desenha o que aparece e carrega
@@ -6991,6 +7464,17 @@ class GradeMidias : Control
     bool arrastando;
     int arrasteY, arrasteRol;
     public event Action<Midia, MouseButtons, Point> Clicou;
+    public event Action SelecaoMudou;
+    public static readonly Font FonteMarca = new Font("Segoe MDL2 Assets", 10f);
+
+    // Selecao: laco = retangulo arrastado com o mouse
+    bool laco, pendente;
+    Point lacoIni, lacoFim;   // no conteudo (com a rolagem)
+    Point desceu;
+    Midia ancora;             // ponto de partida do Shift + clique
+    HashSet<Midia> antesDoLaco = new HashSet<Midia>();
+    readonly Timer rolarLaco = new Timer();
+    int marcadas;
 
     readonly Stack<Midia> pedidos = new Stack<Midia>();
     readonly AutoResetEvent temPedido = new AutoResetEvent(false);
@@ -7001,6 +7485,8 @@ class GradeMidias : Control
     {
         SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint |
                  ControlStyles.Selectable, true);
+        rolarLaco.Interval = 30;
+        rolarLaco.Tick += delegate { RolarNoLaco(); };
         trabalhador = new Thread(Carregador, 512 * 1024);
         trabalhador.IsBackground = true;
         trabalhador.Priority = ThreadPriority.BelowNormal;
@@ -7009,11 +7495,79 @@ class GradeMidias : Control
 
     public void Definir(List<Midia> lista)
     {
+        foreach (Midia m in itens) m.Marcada = false;
+        foreach (Midia m in lista) m.Marcada = false;
         itens = lista;
         rolagem = 0;
         sobre = null;
+        ancora = null;
         Organizar();
+        SelecaoAlterada();
+    }
+
+    // ---- Selecao ----
+    public int Marcadas { get { return marcadas; } }
+
+    public List<Midia> Selecionadas()
+    {
+        List<Midia> l = new List<Midia>();
+        foreach (Midia m in itens) if (m.Marcada) l.Add(m);
+        return l;
+    }
+
+    public void SelecionarTudo() { foreach (Midia m in itens) m.Marcada = true; SelecaoAlterada(); }
+    public void LimparSelecao() { foreach (Midia m in itens) m.Marcada = false; ancora = null; SelecaoAlterada(); }
+    public void Alternar(Midia m) { m.Marcada = !m.Marcada; ancora = m; SelecaoAlterada(); }
+
+    void SelecaoAlterada()
+    {
+        marcadas = 0;
+        foreach (Midia m in itens) if (m.Marcada) marcadas++;
         Invalidate();
+        if (SelecaoMudou != null) SelecaoMudou();
+    }
+
+    // Circulo de marcar, no canto de cima de cada miniatura
+    static Rectangle Circulo(Rectangle r) { return new Rectangle(r.X + 10, r.Y + 10, 26, 26); }
+
+    static Rectangle Retangulo(Point a, Point b)
+    {
+        return Rectangle.FromLTRB(Math.Min(a.X, b.X), Math.Min(a.Y, b.Y), Math.Max(a.X, b.X), Math.Max(a.Y, b.Y));
+    }
+
+    void ComecarLaco(Point p)
+    {
+        laco = true;
+        lacoIni = new Point(desceu.X, desceu.Y + rolagem);
+        antesDoLaco = new HashSet<Midia>();
+        if ((ModifierKeys & (Keys.Control | Keys.Shift)) != 0)
+            foreach (Midia m in itens) if (m.Marcada) antesDoLaco.Add(m);
+        rolarLaco.Start();
+        AtualizarLaco(p);
+    }
+
+    void AtualizarLaco(Point p)
+    {
+        lacoFim = new Point(Math.Max(0, Math.Min(Width, p.X)), Math.Max(0, Math.Min(Height, p.Y)) + rolagem);
+        Rectangle r = Retangulo(lacoIni, lacoFim);
+        foreach (Midia m in itens)
+        {
+            Rectangle c = m.Caixa;
+            c.Height += AlturaTexto;
+            m.Marcada = antesDoLaco.Contains(m) || r.IntersectsWith(c);
+        }
+        SelecaoAlterada();
+    }
+
+    // Arrastando perto da borda de cima ou de baixo: a grade rola sozinha
+    void RolarNoLaco()
+    {
+        if (!laco) { rolarLaco.Stop(); return; }
+        Point p = PointToClient(MousePosition);
+        int d = p.Y < 50 ? -(50 - p.Y) : p.Y > Height - 50 ? p.Y - (Height - 50) : 0;
+        if (d == 0) return;
+        Rolar(Math.Max(-60, Math.Min(60, d)));
+        AtualizarLaco(p);
     }
 
     void Organizar()
@@ -7102,6 +7656,12 @@ class GradeMidias : Control
             arrasteRol = rolagem;
             Capture = true;
         }
+        else if (e.Button == MouseButtons.Left)
+        {
+            pendente = true;
+            desceu = e.Location;
+            Capture = true;
+        }
         base.OnMouseDown(e);
     }
 
@@ -7113,16 +7673,56 @@ class GradeMidias : Control
             rolagem = Math.Max(0, Math.Min(total - Height, arrasteRol + (e.Y - arrasteY) * (total - Height) / livre));
             Invalidate();
         }
-        else AtualizarSobre(e.Location);
+        else
+        {
+            if (pendente && !laco && (Math.Abs(e.X - desceu.X) > 6 || Math.Abs(e.Y - desceu.Y) > 6)) ComecarLaco(e.Location);
+            if (laco) AtualizarLaco(e.Location);
+            else AtualizarSobre(e.Location);
+        }
         base.OnMouseMove(e);
     }
 
     protected override void OnMouseUp(MouseEventArgs e)
     {
-        if (arrastando) { arrastando = false; Capture = false; base.OnMouseUp(e); return; }
-        Midia m = Achar(e.Location);
-        if (m != null && Clicou != null) Clicou(m, e.Button, PointToScreen(e.Location));
         base.OnMouseUp(e);
+        Capture = false;
+        if (arrastando) { arrastando = false; return; }
+        if (laco) { laco = false; pendente = false; rolarLaco.Stop(); Invalidate(); return; }
+        bool clicou = pendente;
+        pendente = false;
+        Midia m = Achar(e.Location);
+
+        if (e.Button == MouseButtons.Right)
+        {
+            if (m != null && Clicou != null) Clicou(m, MouseButtons.Right, PointToScreen(e.Location));
+            return;
+        }
+        if (e.Button != MouseButtons.Left || !clicou) return;
+        Keys mod = ModifierKeys;
+        if (m == null)
+        {
+            if ((mod & Keys.Control) == 0 && marcadas > 0) LimparSelecao();
+            return;
+        }
+        Rectangle r = m.Caixa;
+        r.Offset(0, -rolagem);
+        if ((mod & Keys.Shift) != 0 && ancora != null && itens.Contains(ancora))
+        {
+            int a = itens.IndexOf(ancora), b = itens.IndexOf(m);
+            if ((mod & Keys.Control) == 0) foreach (Midia x in itens) x.Marcada = false;
+            for (int i = Math.Min(a, b); i <= Math.Max(a, b); i++) itens[i].Marcada = true;
+            SelecaoAlterada();
+            return;
+        }
+        if ((mod & Keys.Control) != 0 || marcadas > 0 || Circulo(r).Contains(e.Location))
+        {
+            m.Marcada = !m.Marcada;
+            ancora = m;
+            SelecaoAlterada();
+            return;
+        }
+        ancora = m;
+        if (Clicou != null) Clicou(m, MouseButtons.Left, PointToScreen(e.Location));
     }
 
     protected override void OnMouseLeave(EventArgs e)
@@ -7148,6 +7748,15 @@ class GradeMidias : Control
             if (r.Bottom + AlturaTexto < 0 || r.Top > Height) continue;
             if (e.ClipRectangle.IntersectsWith(new Rectangle(r.X, r.Y, r.Width, r.Height + AlturaTexto))) Desenhar(g, m, r);
             if (m.Mini == null && !m.Pedida) Pedir(m);
+        }
+
+        if (laco)
+        {
+            Rectangle r = Retangulo(lacoIni, lacoFim);
+            r.Offset(0, -topo);
+            g.SmoothingMode = SmoothingMode.None;
+            g.FillRectangle(Tema.Pincel(Color.FromArgb(50, Tema.Destaque)), r);
+            using (Pen pen = new Pen(Tema.Destaque)) g.DrawRectangle(pen, r);
         }
 
         if (total > Height)
@@ -7176,7 +7785,23 @@ class GradeMidias : Control
             }
             else
                 TextRenderer.DrawText(g, m.Video ? "" : "", FonteVazia, r, Tema.CampoSob, Tema.Centro);
-            if (s) using (Pen pen = new Pen(Tema.Destaque, 3)) g.DrawPath(pen, p);
+            if (m.Marcada) g.FillPath(Tema.Pincel(Color.FromArgb(70, Tema.Destaque)), p);
+            if (s || m.Marcada) using (Pen pen = new Pen(Tema.Destaque, 3)) g.DrawPath(pen, p);
+        }
+        // Circulo de marcar: aparece no item sob o mouse ou quando ha selecao
+        if (m.Marcada || s || marcadas > 0)
+        {
+            Rectangle c = Circulo(r);
+            if (m.Marcada)
+            {
+                g.FillEllipse(Tema.Pincel(Tema.Destaque), c);
+                TextRenderer.DrawText(g, "", FonteMarca, c, Color.White, Tema.Centro);
+            }
+            else
+            {
+                g.FillEllipse(Tema.Pincel(Color.FromArgb(120, 0, 0, 0)), c);
+                using (Pen pen = new Pen(Color.FromArgb(230, 255, 255, 255), 2)) g.DrawEllipse(pen, c);
+            }
         }
         if (m.Video)
         {
@@ -7187,8 +7812,8 @@ class GradeMidias : Control
             TextRenderer.DrawText(g, t, Tema.Pequena, b, Color.White, Tema.Centro);
         }
         g.SmoothingMode = SmoothingMode.None;
-        TextRenderer.DrawText(g, m.Video ? "Clipe" : "Print", Tema.Negrito, new Rectangle(r.X + 2, r.Bottom + 8, r.Width - 74, 22),
-            s ? Tema.Destaque : Tema.Texto, Tema.Linha);
+        TextRenderer.DrawText(g, m.Tipo, Tema.Negrito, new Rectangle(r.X + 2, r.Bottom + 8, r.Width - 74, 22),
+            s || m.Marcada ? Tema.Destaque : Tema.Texto, Tema.Linha);
         TextRenderer.DrawText(g, m.Data.ToString("HH:mm"), Tema.Pequena, new Rectangle(r.Right - 72, r.Bottom + 8, 70, 22),
             Tema.Suave, Tema.Linha | TextFormatFlags.Right);
         TextRenderer.DrawText(g, Replay.Tamanho(m.Tamanho) + Tema.Ponto + Path.GetFileName(m.Caminho), Tema.Pequena,
@@ -7267,6 +7892,7 @@ class GradeMidias : Control
     protected override void Dispose(bool disposing)
     {
         Parar();
+        if (disposing) rolarLaco.Dispose();
         base.Dispose(disposing);
     }
 }
@@ -7277,6 +7903,9 @@ class Galeria : Form
 {
     public static Galeria Atual;
     public bool FicarAberta;    // testes: nao fecha ao perder o foco
+    public bool SemConfirmar;   // testes: exclui sem perguntar
+    public GradeMidias Grade { get { return grade; } }
+    public void ExcluirSelecionadas(bool permanente) { Excluir(grade.Selecionadas(), permanente); }
     static readonly Color Fundo = Color.FromArgb(14, 14, 18);
     static readonly Font FonteTitulo = new Font("Segoe UI Semibold", 20f);
 
@@ -7291,16 +7920,23 @@ class Galeria : Form
     Panel config;
     readonly Label[] chips = new Label[3];
     readonly Label vazio, pastaP, pastaC;
-    readonly BotaoGrande btReplay, btSalvar, btConfig;
+    readonly BotaoGrande btReplay, btSalvar, btGravar, btConfig;
     readonly ToolTip dicas = new ToolTip();
     readonly List<Action> atualizar = new List<Action>();
+    readonly Nucleo nucleo;          // para gravar atalhos (null nos testes)
+    int gravandoAtalho = -1;
+    Label msgAtalho;
+    readonly Panel barraSel;         // aparece no lugar dos filtros quando ha selecao
+    readonly Label textoSel;
 
-    public Galeria() : this(Config.PastaPrints, ConfigClipe.Pasta) { }
+    public Galeria(Nucleo n) : this(Config.PastaPrints, ConfigClipe.Pasta, n) { }
 
-    public Galeria(string prints, string clipes)
+    public Galeria(string prints, string clipes, Nucleo n = null)
     {
         pastaPrints = prints;
         pastaClipes = clipes;
+        nucleo = n;
+        if (nucleo != null) nucleo.TeclaGravada += TeclaGravada;
         anterior = Nativo.GetForegroundWindow();
 
         Text = "Galeria";
@@ -7319,16 +7955,36 @@ class Galeria : Form
         barra.BackColor = Fundo;
         barra.Paint += PintarBarra;
 
-        btReplay = new BotaoGrande("", "Replay instantâneo");
+        btReplay = new BotaoGrande("", "Replay instantâneo");
         btSalvar = new BotaoGrande("", "Salvar clipe");
-        btConfig = new BotaoGrande("", "Configurações do clipe");
-        BotaoGrande[] bts = { btReplay, btSalvar, btConfig };
-        int largura = bts.Length * btReplay.Width + (bts.Length - 1) * 14;
-        int x = Math.Max(320, (Width - largura) / 2);
-        foreach (BotaoGrande b in bts) { b.Location = new Point(x, 24); x += b.Width + 14; barra.Controls.Add(b); }
+        btGravar = new BotaoGrande("", "Gravar");
+        btConfig = new BotaoGrande("", "Configurações");
+        BotaoGrande[] bts = { btReplay, btSalvar, btGravar, btConfig };
+        // Cabe numa linha ao lado do titulo? Senao (monitor em pe), desce para uma segunda linha
+        int livre = Width - 300 - 110, largBt, x, yBt = 24;
+        if (4 * 230 + 3 * 12 <= livre)
+        {
+            largBt = Math.Min(290, (livre - 3 * 12) / 4);
+            x = Math.Max(300, (Width - (4 * largBt + 3 * 12)) / 2);
+        }
+        else
+        {
+            largBt = Math.Min(290, (Width - 2 * GradeMidias.Margem - 3 * 12) / 4);
+            x = GradeMidias.Margem;
+            yBt = 108;
+            barra.Height = 204;
+        }
+        foreach (BotaoGrande b in bts) { b.Width = largBt; b.Location = new Point(x, yBt); x += b.Width + 12; barra.Controls.Add(b); }
         btReplay.Click += delegate { Replay.DefinirLigado(!ConfigClipe.Ligado); };
         btSalvar.Click += delegate { Replay.SalvarClipe(); };
+        btGravar.Click += delegate
+        {
+            bool comecar = !Gravacao.Ativa;
+            Gravacao.Alternar();
+            if (comecar) Close();   // volta para o jogo
+        };
         btConfig.Click += delegate { MostrarConfig(!emConfig); };
+        dicas.SetToolTip(btGravar, "Grava até você parar (" + Config.Atalhos[Config.Gravar] + ")");
         dicas.SetToolTip(btReplay, "Liga ou desliga (" + Config.Atalhos[Config.AlternarReplay] + ")");
         dicas.SetToolTip(btSalvar, "Salva os últimos segundos (" + Config.Atalhos[Config.SalvarClipe] + ")");
 
@@ -7372,6 +8028,27 @@ class Galeria : Form
         filtros.Controls.Add(pastaP);
         filtros.Controls.Add(pastaC);
 
+        // ---- Barra da selecao ----
+        barraSel = new Panel();
+        barraSel.Dock = DockStyle.Top;
+        barraSel.Height = 70;
+        barraSel.BackColor = Fundo;
+        barraSel.Visible = false;
+        textoSel = new Label();
+        textoSel.Font = Tema.Titulo;
+        textoSel.ForeColor = Tema.Texto;
+        textoSel.BackColor = Fundo;
+        textoSel.TextAlign = ContentAlignment.MiddleLeft;
+        textoSel.Bounds = new Rectangle(GradeMidias.Margem, 16, 240, 38);
+        barraSel.Controls.Add(textoSel);
+        int xs = GradeMidias.Margem + 250;
+        xs = BotaoSel(xs, "Copiar", Tema.Campo, delegate { Copiar(grade.Selecionadas()); });
+        xs = BotaoSel(xs, "Mostrar na pasta", Tema.Campo, delegate { MostrarVarios(grade.Selecionadas()); });
+        xs = BotaoSel(xs, "Mandar para a Lixeira", Tema.Campo, delegate { Excluir(grade.Selecionadas(), false); });
+        xs = BotaoSel(xs, "Excluir permanentemente", Color.FromArgb(120, 36, 36), delegate { Excluir(grade.Selecionadas(), true); });
+        xs = BotaoSel(xs + 16, "Selecionar tudo", Tema.Campo, delegate { grade.SelecionarTudo(); });
+        BotaoSel(xs, "Cancelar", Tema.Campo, delegate { grade.LimparSelecao(); });
+
         // ---- Corpo ----
         corpo = new Panel();
         corpo.Dock = DockStyle.Fill;
@@ -7380,6 +8057,7 @@ class Galeria : Form
         grade.Dock = DockStyle.Fill;
         grade.BackColor = Fundo;
         grade.Clicou += Clicou;
+        grade.SelecaoMudou += AtualizarSelecao;
         vazio = new Label();
         vazio.Dock = DockStyle.Fill;
         vazio.TextAlign = ContentAlignment.MiddleCenter;
@@ -7391,12 +8069,50 @@ class Galeria : Form
         corpo.Controls.Add(vazio);
 
         Controls.Add(corpo);
+        Controls.Add(barraSel);
         Controls.Add(filtros);
         Controls.Add(barra);
 
         Replay.Mudou += AtualizarReplay;
         AtualizarReplay();
         Carregar();
+    }
+
+    // Nao aparece nos clipes nem nas gravacoes
+    protected override void OnHandleCreated(EventArgs e) { base.OnHandleCreated(e); Capturas.Esconder(Handle); }
+
+    int BotaoSel(int x, string texto, Color fundo, Action acao)
+    {
+        Label b = new Label();
+        b.Text = texto;
+        b.Font = Tema.Negrito;
+        b.ForeColor = Tema.Texto;
+        b.BackColor = fundo;
+        b.UseMnemonic = false;
+        b.TextAlign = ContentAlignment.MiddleCenter;
+        b.Cursor = Cursors.Hand;
+        int w = TextRenderer.MeasureText(texto, Tema.Negrito).Width + 32, y = 16;
+        foreach (Control c in barraSel.Controls) y = Math.Max(y, c.Top);
+        if (x + w > Width - GradeMidias.Margem)   // tela estreita: quebra a linha
+        {
+            x = GradeMidias.Margem;
+            y += 46;
+            barraSel.Height = y + 54;
+        }
+        b.Bounds = new Rectangle(x, y, w, 38);
+        Color sob = ControlPaint.Light(fundo, 0.25f);
+        b.MouseEnter += delegate { b.BackColor = sob; };
+        b.MouseLeave += delegate { b.BackColor = fundo; };
+        b.MouseDown += delegate(object s, MouseEventArgs e) { if (e.Button == MouseButtons.Left) acao(); };
+        barraSel.Controls.Add(b);
+        return b.Right + 8;
+    }
+
+    void AtualizarSelecao()
+    {
+        int n = grade.Marcadas;
+        textoSel.Text = n == 1 ? "1 selecionado" : n + " selecionados";
+        AtualizarCorpo();
     }
 
     Label LinkPasta(string texto, Func<string> pasta)
@@ -7418,7 +8134,7 @@ class Galeria : Form
     void PintarBarra(object s, PaintEventArgs e)
     {
         TextRenderer.DrawText(e.Graphics, "Galeria", FonteTitulo, new Point(44, 28), Tema.Texto);
-        TextRenderer.DrawText(e.Graphics, "Prints e clipes" + Tema.Ponto + Config.Atalhos[Config.AbrirGaleria], Tema.Pequena,
+        TextRenderer.DrawText(e.Graphics, Config.Nome + Tema.Ponto + "prints, clipes e gravações" + Tema.Ponto + Config.Atalhos[Config.AbrirGaleria], Tema.Pequena,
             new Point(48, 72), Tema.Suave);
         e.Graphics.FillRectangle(Tema.Pincel(Tema.Borda), GradeMidias.Margem, barra.Height - 1, barra.Width - 2 * GradeMidias.Margem, 1);
     }
@@ -7502,24 +8218,35 @@ class Galeria : Form
 
     void AtualizarCorpo()
     {
-        filtros.Visible = !emConfig;
+        bool sel = !emConfig && grade.Marcadas > 0;
+        barraSel.Visible = sel;
+        filtros.Visible = !emConfig && !sel;
         grade.Visible = !emConfig && visiveis.Count > 0;
         vazio.Visible = !emConfig && visiveis.Count == 0;
         if (config != null) config.Visible = emConfig;
     }
 
     // ---- Acoes nos itens ----
+    // Botao direito: vale para a selecao se o item estiver nela, senao so para ele
     void Clicou(Midia m, MouseButtons b, Point tela)
     {
         if (b == MouseButtons.Left) { Abrir(m); return; }
         if (b != MouseButtons.Right) return;
+        List<Midia> alvo = m.Marcada ? grade.Selecionadas() : new List<Midia> { m };
+        bool um = alvo.Count == 1;
         ContextMenuStrip menu = CoresMenu.NovoMenu();
-        ToolStripItem abrir = menu.Items.Add(m.Video ? "Assistir" : "Abrir no editor", null, delegate { Abrir(m); });
-        abrir.Font = Tema.Negrito;
-        menu.Items.Add(m.Video ? "Copiar o arquivo do clipe" : "Copiar a imagem", null, delegate { Copiar(m); });
-        menu.Items.Add("Mostrar na pasta", null, delegate { abrindo = true; MostrarNaPasta(m.Caminho); Close(); });
+        if (um)
+        {
+            ToolStripItem abrir = menu.Items.Add(m.Video ? "Assistir" : "Abrir no editor", null, delegate { Abrir(m); });
+            abrir.Font = Tema.Negrito;
+        }
+        menu.Items.Add(um ? (m.Video ? "Copiar o arquivo" : "Copiar a imagem") : "Copiar " + alvo.Count + " arquivos", null, delegate { Copiar(alvo); });
+        menu.Items.Add("Mostrar na pasta", null, delegate { MostrarVarios(alvo); });
+        if (!m.Marcada) menu.Items.Add("Selecionar", null, delegate { grade.Alternar(m); });
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("Excluir (vai para a Lixeira)", null, delegate { Excluir(m); });
+        menu.Items.Add(um ? "Mandar para a Lixeira" : "Mandar " + alvo.Count + " para a Lixeira", null, delegate { Excluir(alvo, false); });
+        ToolStripItem perm = menu.Items.Add(um ? "Excluir permanentemente" : "Excluir " + alvo.Count + " permanentemente", null, delegate { Excluir(alvo, true); });
+        perm.ForeColor = Tema.Perigo;
         menu.Closed += delegate { BeginInvoke((MethodInvoker)delegate { menu.Dispose(); }); };
         menu.Show(tela);
     }
@@ -7552,31 +8279,66 @@ class Galeria : Form
         catch (Exception ex) { App.Log("Erro ao mostrar na pasta: " + ex.Message); }
     }
 
-    void Copiar(Midia m)
+    // Uma janela do Explorer por pasta (prints e clipes ficam em pastas diferentes)
+    void MostrarVarios(List<Midia> alvo)
     {
+        if (alvo.Count == 0) return;
+        abrindo = true;
+        HashSet<string> pastas = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (Midia m in alvo)
+            if (pastas.Add(Path.GetDirectoryName(m.Caminho))) MostrarNaPasta(m.Caminho);
+        Close();
+    }
+
+    // Uma imagem vai como imagem (cola em qualquer lugar); o resto vai como arquivos
+    void Copiar(List<Midia> alvo)
+    {
+        if (alvo.Count == 0) return;
         try
         {
-            if (m.Video)
+            if (alvo.Count == 1 && !alvo[0].Video)
+                using (Bitmap b = Historico.LerImagem(alvo[0].Caminho)) App.PorImagem(b);
+            else
             {
                 System.Collections.Specialized.StringCollection l = new System.Collections.Specialized.StringCollection();
-                l.Add(m.Caminho);
+                foreach (Midia m in alvo) l.Add(m.Caminho);
                 Clipboard.SetFileDropList(l);
             }
-            else using (Bitmap b = Historico.LerImagem(m.Caminho)) App.PorImagem(b);
-            Aviso.Mostrar(m.Video ? "Clipe copiado" : "Imagem copiada", "Cole com Ctrl + V (no WhatsApp, Discord...)", Tema.Sucesso);
+            Aviso.Mostrar(alvo.Count == 1 ? alvo[0].Tipo + " copiado" : alvo.Count + " arquivos copiados",
+                "Cole com Ctrl + V (no WhatsApp, Discord, numa pasta...)", Tema.Sucesso);
         }
         catch (Exception ex) { App.Log("Erro ao copiar da galeria: " + ex.Message); }
     }
 
-    void Excluir(Midia m)
+    void Excluir(List<Midia> alvo, bool permanente)
     {
+        if (alvo.Count == 0) return;
         dialogo = true;
         try
         {
-            Microsoft.VisualBasic.FileIO.FileSystem.DeleteFile(m.Caminho,
-                Microsoft.VisualBasic.FileIO.UIOption.OnlyErrorDialogs, Microsoft.VisualBasic.FileIO.RecycleOption.SendToRecycleBin);
+            if (permanente && !SemConfirmar)
+            {
+                string q = alvo.Count == 1 ? "\"" + Path.GetFileName(alvo[0].Caminho) + "\"" : alvo.Count + " itens";
+                if (MessageBox.Show(this, "Excluir " + q + " para sempre?\n\nN\u00e3o vai para a Lixeira e n\u00e3o d\u00e1 para desfazer.",
+                        Config.Nome, MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
+                    return;
+            }
+            int erros = 0;
+            foreach (Midia m in alvo)
+            {
+                try
+                {
+                    if (permanente) File.Delete(m.Caminho);
+                    else Microsoft.VisualBasic.FileIO.FileSystem.DeleteFile(m.Caminho,
+                        Microsoft.VisualBasic.FileIO.UIOption.OnlyErrorDialogs, Microsoft.VisualBasic.FileIO.RecycleOption.SendToRecycleBin);
+                }
+                catch (Exception ex) { erros++; App.Log("Erro ao excluir " + m.Caminho + ": " + ex.Message); }
+            }
+            int feitos = alvo.Count - erros;
+            if (feitos > 0)
+                Aviso.Mostrar((feitos == 1 ? "1 item " : feitos + " itens ") + (permanente ? "exclu\u00eddo" + (feitos == 1 ? "" : "s") + " para sempre" : "na Lixeira"),
+                    erros > 0 ? erros + " n\u00e3o deu (arquivo em uso?)" : permanente ? "" : "D\u00e1 para restaurar pela Lixeira do Windows", permanente ? Tema.Perigo : Tema.Sucesso);
         }
-        catch (Exception ex) { App.Log("Erro ao excluir " + m.Caminho + ": " + ex.Message); }
         finally { dialogo = false; }
         Activate();
         Carregar();
@@ -7595,7 +8357,13 @@ class Galeria : Form
         btReplay.Definir(sub, ConfigClipe.Ligado, aceso);
         btSalvar.Definir(Replay.Salvando ? "Salvando..." : "Últimos " + ConfigClipe.NomeDuracao(ConfigClipe.Segundos) +
                          Tema.Ponto + Config.Atalhos[Config.SalvarClipe], false, false);
-        btConfig.Definir("Qualidade, FPS, bits, som", emConfig, false);
+        string subGravar;
+        if (Gravacao.Ativa) subGravar = "Gravando " + Gravacao.Tempo + Tema.Ponto + "clique para parar";
+        else if (Gravacao.Iniciando) subGravar = "Iniciando...";
+        else if (Gravacao.Parando) subGravar = "Salvando a gravação...";
+        else subGravar = "Até você parar" + Tema.Ponto + Config.Atalhos[Config.Gravar];
+        btGravar.Definir(subGravar, Gravacao.Ativa, Gravacao.Ativa);
+        btConfig.Definir("Qualidade, FPS, som, atalhos", emConfig, false);
         foreach (Action a in atualizar) a();
     }
 
@@ -7612,6 +8380,8 @@ class Galeria : Form
 
     int x0, xv;   // colunas: rotulo e valor
     const int LarguraConfig = 1040;
+    int Direita { get { return Math.Min(x0 + LarguraConfig, Width - 40); } }   // limite sem rolagem para o lado
+    int LarguraNota { get { return Direita - xv; } }
 
     Label Texto(int x, int y, int w, int h, string t, Font f, Color c)
     {
@@ -7647,7 +8417,7 @@ class Galeria : Form
 
     void Nota(ref int y, Func<string> texto, Func<Color> cor)
     {
-        Label l = Texto(xv, y - 6, LarguraConfig - (xv - x0), 22, "", Tema.Pequena, Tema.Suave);
+        Label l = Texto(xv, y - 6, LarguraNota, 22, "", Tema.Pequena, Tema.Suave);
         l.AutoEllipsis = true;
         atualizar.Add(delegate { l.Text = texto(); if (cor != null) l.ForeColor = cor(); });
         y += 26;
@@ -7669,7 +8439,7 @@ class Galeria : Form
         for (int i = 0; i < nomes.Length; i++)
         {
             int w = TextRenderer.MeasureText(nomes[i], Tema.Pequena).Width + 28;
-            if (x + w > x0 + LarguraConfig) { x = xv; y += 40; }
+            if (x + w > Direita) { x = xv; y += 40; }
             Label b = Texto(x, y, w, 34, nomes[i], Tema.Pequena, Tema.Texto);
             b.TextAlign = ContentAlignment.MiddleCenter;
             x += w + 6;
@@ -7731,6 +8501,8 @@ class Galeria : Form
         for (int i = 0; i < dur.Length; i++) dur[i] = ConfigClipe.NomeDuracao(ConfigClipe.Duracoes[i]);
         Opcoes(ref y, "Duração do clipe", dur, delegate { return Array.IndexOf(ConfigClipe.Duracoes, ConfigClipe.Segundos); },
                delegate(int i) { ConfigClipe.Segundos = ConfigClipe.Duracoes[i]; }, null);
+
+        SecaoAtalhos(ref y);
 
         Secao(ref y, "Vídeo");
         Opcoes(ref y, "Qualidade", ConfigClipe.NomesQualidade, ConfigClipe.Qualidade, ConfigClipe.UsarQualidade,
@@ -7837,14 +8609,107 @@ class Galeria : Form
         });
         y += 44;
 
-        Secao(ref y, "Atalhos");
-        Nota(ref y, delegate
-        {
-            return Config.Atalhos[Config.AbrirGaleria] + "  galeria" + Tema.Ponto + Config.Atalhos[Config.SalvarClipe] + "  salvar clipe" +
-                   Tema.Ponto + Config.Atalhos[Config.AlternarReplay] + "  liga/desliga o replay";
-        }, null);
-        Nota(ref y, delegate { return "Para mudar, use a engrenagem da janela da área de transferência."; }, null);
         Texto(x0, y + 20, 10, 20, "", Tema.Pequena, Tema.Suave);   // margem no fim da rolagem
+    }
+
+    // ---- Atalhos dos clipes: clique na caixa e aperte a combinacao ----
+    static readonly int[] AtalhosDaGaleria = { Config.SalvarClipe, Config.Gravar, Config.AbrirGaleria, Config.AlternarReplay };
+    readonly Label[] caixasAtalho = new Label[4];
+
+    void SecaoAtalhos(ref int y)
+    {
+        Secao(ref y, "Atalhos");
+        for (int i = 0; i < AtalhosDaGaleria.Length; i++)
+        {
+            int acao = AtalhosDaGaleria[i];
+            Texto(x0, y, xv - x0 - 10, 34, Config.NomesAcoes[acao], Tema.Normal, Tema.Texto);
+            Label caixa = Texto(xv, y, 280, 34, "", Tema.Negrito, Tema.Texto);
+            caixa.BackColor = Tema.Campo;
+            caixa.TextAlign = ContentAlignment.MiddleCenter;
+            caixa.Cursor = nucleo != null ? Cursors.Hand : Cursors.Default;
+            caixa.MouseEnter += delegate { if (gravandoAtalho != acao) caixa.BackColor = Tema.CampoSob; };
+            caixa.MouseLeave += delegate { caixa.BackColor = Tema.Campo; };
+            caixa.MouseDown += delegate { ComecarAtalho(acao); };
+            dicas.SetToolTip(caixa, "Clique e aperte a nova combinação");
+            caixasAtalho[i] = caixa;
+            y += 42;
+        }
+        atualizar.Add(MostrarAtalhos);
+        msgAtalho = Texto(xv, y - 4, LarguraNota, 22,
+            "Clique numa caixa e aperte a combinação" + Tema.Ponto + "Esc cancela" + Tema.Ponto + "Backspace remove",
+            Tema.Pequena, Tema.Suave);
+        y += 24;
+        Label restaurar = Botao(xv, y, "Restaurar os padrões (Alt + F10, Alt + F9, Alt + Z, Alt + Shift + F10)");
+        restaurar.MouseDown += delegate
+        {
+            PararAtalho();
+            foreach (int a in AtalhosDaGaleria) Config.Atalhos[a] = Config.Padrao[a];
+            // Se algum outro atalho ja usava a mesma combinacao, ele fica sem
+            for (int j = 0; j < Config.Atalhos.Length; j++)
+                if (Array.IndexOf(AtalhosDaGaleria, j) < 0)
+                    foreach (int a in AtalhosDaGaleria)
+                        if (Config.Atalhos[j].Igual(Config.Atalhos[a])) Config.Atalhos[j] = new Atalho(0, 0);
+            SalvarAtalhos("Atalhos padrão restaurados.", false);
+        };
+        y += 48;
+    }
+
+    void MostrarAtalhos()
+    {
+        for (int i = 0; i < AtalhosDaGaleria.Length; i++)
+        {
+            if (caixasAtalho[i] == null) continue;
+            int acao = AtalhosDaGaleria[i];
+            if (acao == gravandoAtalho) { caixasAtalho[i].Text = "Aperte as teclas..."; caixasAtalho[i].ForeColor = Tema.Destaque; continue; }
+            Atalho a = Config.Atalhos[acao];
+            caixasAtalho[i].Text = a.ToString();
+            caixasAtalho[i].ForeColor = a.Vazio ? Tema.Suave : Tema.Texto;
+        }
+    }
+
+    void ComecarAtalho(int acao)
+    {
+        if (nucleo == null) return;
+        gravandoAtalho = acao;
+        nucleo.Gravando = true;
+        Mensagem("", false);
+        MostrarAtalhos();
+    }
+
+    void PararAtalho()
+    {
+        gravandoAtalho = -1;
+        if (nucleo != null) nucleo.Gravando = false;
+        MostrarAtalhos();
+    }
+
+    void Mensagem(string t, bool erro)
+    {
+        if (msgAtalho == null) return;
+        msgAtalho.Text = t;
+        msgAtalho.ForeColor = erro ? Tema.Perigo : Tema.Sucesso;
+    }
+
+    // Vem do gancho de teclado (que esconde a tecla do resto do Windows)
+    void TeclaGravada(Atalho a)
+    {
+        if (gravandoAtalho < 0 || IsDisposed) return;
+        int i = gravandoAtalho;
+        if (a.Vk == 0x1B && a.Mods == 0) { PararAtalho(); return; }                          // Esc
+        if (a.Vk == 0x08 && a.Mods == 0) { Config.Atalhos[i] = new Atalho(0, 0); SalvarAtalhos("Atalho removido.", false); return; }
+        string problema = Config.ProblemaDoAtalho(i, a);
+        if (problema != null) { PararAtalho(); Mensagem(problema, true); return; }
+        Config.Atalhos[i] = a;
+        SalvarAtalhos("Salvo: " + Config.NomesAcoes[i] + " = " + a, false);
+    }
+
+    void SalvarAtalhos(string msg, bool erro)
+    {
+        gravandoAtalho = -1;
+        if (nucleo != null) { nucleo.Gravando = false; nucleo.RegistrarReservas(); }
+        Config.Salvar();
+        AtualizarReplay();
+        Mensagem(msg, erro);
     }
 
     void EscolherPasta()
@@ -7873,11 +8738,21 @@ class Galeria : Form
     // ---- Teclado e ciclo de vida ----
     protected override bool ProcessCmdKey(ref Message msg, Keys k)
     {
-        if (k == Keys.Escape) { if (emConfig) MostrarConfig(false); else Close(); return true; }
+        if (k == Keys.Escape)
+        {
+            if (emConfig) MostrarConfig(false);
+            else if (grade.Marcadas > 0) grade.LimparSelecao();
+            else Close();
+            return true;
+        }
         if (!emConfig)
         {
             switch (k)
             {
+                case Keys.Control | Keys.A: grade.SelecionarTudo(); return true;
+                case Keys.Control | Keys.C: if (grade.Marcadas > 0) Copiar(grade.Selecionadas()); return true;
+                case Keys.Delete:           if (grade.Marcadas > 0) Excluir(grade.Selecionadas(), false); return true;
+                case Keys.Shift | Keys.Delete: if (grade.Marcadas > 0) Excluir(grade.Selecionadas(), true); return true;
                 case Keys.PageDown: grade.Rolar(grade.Height - 120); return true;
                 case Keys.PageUp:   grade.Rolar(-(grade.Height - 120)); return true;
                 case Keys.Down:     grade.Rolar(120); return true;
@@ -7904,6 +8779,11 @@ class Galeria : Form
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
         Replay.Mudou -= AtualizarReplay;
+        if (nucleo != null)
+        {
+            nucleo.TeclaGravada -= TeclaGravada;
+            if (gravandoAtalho >= 0) nucleo.Gravando = false;
+        }
         if (Atual == this) Atual = null;
         grade.Parar();
         foreach (Midia m in todas)

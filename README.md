@@ -1,6 +1,8 @@
-# ClipHistorico
+# Trajado Tools
 
-Área de transferência e prints para Windows, para quem usa uma instalação sem o `Win + V` e sem ferramenta de captura. Leve, em um único arquivo C#, sem nada para instalar além do que já vem no Windows.
+Área de transferência, prints, clipes e gravação de tela para Windows, para quem usa uma instalação sem o `Win + V`, sem ferramenta de captura e sem a sobreposição da NVIDIA. Leve, em um único arquivo C#, sem nada para instalar além do que já vem no Windows (e do ffmpeg, para os vídeos).
+
+Até a versão 1.6 se chamava **ClipHistorico**. Ao abrir a versão nova, as pastas antigas são renomeadas sozinhas e nada se perde.
 
 ## O que faz
 
@@ -11,8 +13,14 @@
 - **Recorte de tela:** `Win + Shift + S` congela a tela (todos os monitores), você arrasta a área e ela vai para a área de transferência e para o histórico. Funciona em cima de jogos e programas em tela cheia.
 - **Salvar imagem como arquivo:** PNG, JPG ou BMP.
 - **Editor de imagem:** tela cheia, com lápis, marca-texto, borracha, borrar, setas, retângulos, texto, recorte e outra imagem por cima. Abra com o botão **Editar**, `Ctrl + E` ou dois cliques na prévia. O que for borrado é substituído na própria imagem, sem como recuperar no arquivo final. `Ctrl + scroll` aproxima e afasta, `Shift + scroll` anda para os lados e o scroll sozinho anda para cima e para baixo.
-- **Clipes (replay instantâneo):** como o da NVIDIA. Grava a tela o tempo todo e `Alt + F10` salva os últimos segundos (15 s a 10 min) em `Vídeos\CLIPES`, com o som do PC e, se quiser, o microfone. A tela é capturada e codificada na placa de vídeo (NVENC, AMD ou Intel, com o processador como último recurso). Numa RTX 3060, gravando 1080p a 60 FPS, usa cerca de 2% de um núcleo do processador, e salvar leva menos de 1 segundo. Dá para configurar duração, qualidade, resolução, FPS, taxa de bits, formato (H.264, HEVC ou AV1, conforme a placa), monitor e cursor.
-- **Galeria (`Alt + Z`):** prints e clipes numa tela só, separados por dia, com o replay e as configurações dos clipes no topo. Um clique abre (clipe no player, print no editor). O botão direito copia, mostra na pasta ou manda para a Lixeira.
+- **Clipes (replay instantâneo):** como o da NVIDIA. Grava a tela o tempo todo e `Alt + F10` salva os últimos segundos (15 s a 10 min) em `Vídeos\CLIPES`, com o som do PC e, se quiser, o microfone. A tela é capturada e codificada na placa de vídeo (NVENC, AMD ou Intel, com o processador como último recurso). Numa RTX 3060, gravando 1080p a 60 FPS, usa cerca de 2% de um núcleo do processador, e salvar leva menos de 1 segundo.
+- **Gravação:** `Alt + F9` começa e para. Grava até você parar, com as mesmas configurações dos clipes, e salva em `Vídeos\CLIPES` como `gravacao-....mp4`. Um "● REC" com o tempo aparece no canto, mas não sai no vídeo. Se o programa fechar no meio, o que foi gravado aparece na pasta na próxima vez.
+- **Vigia da captura:** se a captura da tela travar sem fechar (aconteceu ao abrir o BlueStacks, que mexe no modo da tela), o replay reinicia sozinho em até 5 segundos e a gravação salva o que tem e continua num arquivo novo. Um clipe nunca sai com imagem de minutos atrás.
+- **Galeria (`Alt + Z`):** prints, clipes e gravações numa tela só, separados por dia, com o replay, a gravação e as configurações no topo. Um clique abre (vídeo no player, print no editor).
+  - **Selecionar vários:** arraste um retângulo com o mouse (a tela rola sozinha perto da borda), clique no círculo do canto, use `Ctrl + clique`, `Shift + clique` ou `Ctrl + A`.
+  - **Com a seleção:** copiar (cola como arquivos no WhatsApp, Discord ou numa pasta), mostrar na pasta, mandar para a Lixeira (`Delete`) ou **excluir permanentemente** (`Shift + Delete`, pede confirmação).
+  - **Configurações:** duração, qualidade, resolução, FPS, taxa de bits, formato (H.264, HEVC ou AV1, conforme a placa), monitor, som, cursor, pasta e os **atalhos** dos vídeos.
+- A galeria e os avisos não aparecem nos clipes nem nas gravações.
 - **Atalhos configuráveis**, início junto com o Windows e opção de colar sozinho.
 
 | Ação | Atalho padrão |
@@ -24,15 +32,16 @@
 | Recortar parte da tela | `Win + Shift + S` |
 | Galeria de prints e clipes | `Alt + Z` |
 | Salvar clipe (replay) | `Alt + F10` |
+| Iniciar ou parar a gravação | `Alt + F9` |
 | Ligar ou desligar o replay | `Alt + Shift + F10` |
 
 No Histórico e nos Salvos, um clique mostra o item e o duplo clique (ou Enter) copia, cola e fecha.
 
 ## Instalar
 
-Baixe o zip da versão mais recente em [Releases](../../releases), extraia em uma pasta e abra o `ClipHistorico.exe`. Requer Windows 10 ou mais novo com .NET Framework 4.5.
+Baixe o zip da versão mais recente em [Releases](../../releases), extraia em uma pasta e abra o `TrajadoTools.exe`. Requer Windows 10 ou mais novo com .NET Framework 4.5.
 
-Os clipes precisam do [ffmpeg](https://ffmpeg.org) (versão 7 ou mais nova). Se ele não estiver no computador, use **Baixar o ffmpeg** nas configurações da galeria (`Alt + Z`). O programa baixa o pacote oficial do [gyan.dev](https://www.gyan.dev/ffmpeg/builds/), com cerca de 115 MB, e guarda só o `ffmpeg.exe` em `%LOCALAPPDATA%\ClipHistorico\ffmpeg`. Ele também é encontrado se estiver ao lado do `.exe` ou no `PATH`.
+Os clipes e as gravações precisam do [ffmpeg](https://ffmpeg.org) (versão 7 ou mais nova). Se ele não estiver no computador, use **Baixar o ffmpeg** nas configurações da galeria (`Alt + Z`). O programa baixa o pacote oficial do [gyan.dev](https://www.gyan.dev/ffmpeg/builds/), com cerca de 115 MB, e guarda só o `ffmpeg.exe` em `%LOCALAPPDATA%\TrajadoTools\ffmpeg`. Ele também é encontrado se estiver ao lado do `.exe` ou no `PATH`.
 
 ## Compilar
 
@@ -42,21 +51,23 @@ Rode o `compilar.bat`. Ele usa o compilador que já vem no Windows, fecha o prog
 
 | O quê | Pasta |
 |---|---|
-| Histórico | `%USERPROFILE%\ClipHistorico` |
+| Histórico | `%USERPROFILE%\TrajadoTools` |
 | Prints | `Imagens\PRINTS` |
-| Clipes | `Vídeos\CLIPES` (dá para mudar) |
-| Gravação do replay e miniaturas | `%LOCALAPPDATA%\ClipHistorico` |
-| Salvos e configurações | `%APPDATA%\ClipHistorico` |
+| Clipes e gravações | `Vídeos\CLIPES` (dá para mudar) |
+| Replay, gravação em andamento e miniaturas | `%LOCALAPPDATA%\TrajadoTools` |
+| Salvos e configurações | `%APPDATA%\TrajadoTools` |
 
 O histórico fica em arquivos comuns, sem criptografia. Tudo o que você copiar, inclusive senhas, é gravado nessa pasta até vencer o prazo, sair da lista ou ser apagado. Use **Pausar captura** no ícone perto do relógio para evitar isso.
 
 ## Testes
 
-`testes/Teste.cs` testa o programa sem abrir nada na tela e sem tocar no seu histórico. Só entra na compilação com `/define:TESTE`:
+`testes/Teste.cs` testa o programa sem tocar no seu histórico. Só entra na compilação com `/define:TESTE`:
 
 ```
-csc /target:exe /platform:x86 /define:TESTE /resource:emojis.gz,emojis.gz /out:teste.exe /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.IO.Compression.dll /r:Microsoft.VisualBasic.dll ClipHistorico.cs testes\Teste.cs
+csc /target:exe /platform:x86 /define:TESTE /resource:emojis.gz,emojis.gz /out:teste.exe /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.IO.Compression.dll /r:Microsoft.VisualBasic.dll TrajadoTools.cs testes\Teste.cs
 teste.exe <pasta para os arquivos de teste>
 ```
 
-Os testes de clipe gravam a tela de verdade por alguns segundos (com o ffmpeg). `teste.exe <pasta> clipes` roda só eles. `teste.exe <pasta> sincronia` pisca um quadrado branco no canto da tela e toca um bipe ao mesmo tempo, para medir se o som está no compasso do vídeo.
+Deixe o mouse no monitor principal: o editor e a galeria abrem na tela do mouse, e os testes do editor contam com uma tela larga.
+
+Os testes de vídeo gravam a tela de verdade por alguns segundos (com o ffmpeg) e congelam o ffmpeg de propósito para testar o vigia. `teste.exe <pasta> clipes` roda só eles. `teste.exe <pasta> sincronia` pisca um quadrado branco no canto da tela e toca um bipe ao mesmo tempo, para medir se o som está no compasso do vídeo.

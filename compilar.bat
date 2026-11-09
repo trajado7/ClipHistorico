@@ -1,5 +1,5 @@
 @echo off
-title Compilando ClipHistorico
+title Compilando Trajado Tools
 cd /d "%~dp0"
 
 rem Usa o compilador C# que ja vem com o Windows (.NET Framework 4)
@@ -21,11 +21,12 @@ if not exist "emojis.gz" (
 )
 
 rem Fecha o programa: aberto, ele trava o .exe e a compilacao falha
+taskkill /IM TrajadoTools.exe /F >nul 2>&1
 taskkill /IM ClipHistorico.exe /F >nul 2>&1
 timeout /t 1 /nobreak >nul
 
 rem x86 = versao 32 bits, que usa menos memoria
-"%CSC%" /nologo /target:winexe /platform:x86 /optimize+ /debug- %ICONE% /resource:emojis.gz,emojis.gz /out:ClipHistorico.exe /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.IO.Compression.dll /r:Microsoft.VisualBasic.dll ClipHistorico.cs
+"%CSC%" /nologo /target:winexe /platform:x86 /optimize+ /debug- %ICONE% /resource:emojis.gz,emojis.gz /out:TrajadoTools.exe /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.IO.Compression.dll /r:Microsoft.VisualBasic.dll TrajadoTools.cs
 
 if errorlevel 1 (
     echo.
@@ -34,8 +35,8 @@ if errorlevel 1 (
     exit /b 1
 )
 
-start "" "%~dp0ClipHistorico.exe"
+start "" "%~dp0TrajadoTools.exe"
 
 echo.
-echo Pronto! O ClipHistorico foi atualizado e ja esta aberto.
+echo Pronto! O Trajado Tools foi atualizado e ja esta aberto.
 pause
