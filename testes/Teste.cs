@@ -610,32 +610,55 @@ static class Teste
 
         Replay.Opcoes o = new Replay.Opcoes();
         o.Fps = 60; o.Mbps = 50; o.Segundos = 30; o.Monitor = 1; o.Codificador = "h264_nvenc"; o.MostrarCursor = true;
-        string a = Replay.MontarArgs(o, null, null);
+        string a = Replay.MontarArgs(o, null, null, 3, 0);
         Console.WriteLine(a);
         Ok(a.Contains("ddagrab=output_idx=1:framerate=60:draw_mouse=1") && !a.Contains("-vf") && !a.Contains("-c:a"), "nativa: tudo na placa, sem filtro e sem som");
         Ok(a.Contains("-segment_wrap 38") && a.Contains("-segment_list_size 38") && a.Contains("-b:v 50000k -maxrate 75000k"), "anel e taxa de bits");
+        Ok(a.Contains("-segment_list lista_s00003.csv") && a.EndsWith("s00003_%04d.ts") && !a.Contains("output_ts_offset"), "nomes da sessao, sem deslocamento na primeira");
+        a = Replay.MontarArgs(o, null, null, 4, 12.5);
+        Ok(a.Contains("-output_ts_offset 12.500 ") && a.EndsWith("s00004_%04d.ts"), "sessao seguinte continua o relogio (com ponto, nao virgula)");
         o.Altura = 720;
-        a = Replay.MontarArgs(o, "-f f32le -i A", "-f f32le -i B");
+        a = Replay.MontarArgs(o, "-f f32le -i A", "-f f32le -i B", 1, 0);
         Ok(a.Contains("hwdownload") && a.Contains("min(720,ih)") && a.Contains("amix=inputs=2") && a.Contains("-map \"[som]\"") && a.Contains("-c:a aac"), "720p com som do PC e microfone");
-        a = Replay.MontarArgs(o, "-f f32le -i A", null);
+        a = Replay.MontarArgs(o, "-f f32le -i A", null, 1, 0);
         Ok(a.Contains("-map 1:a") && !a.Contains("amix"), "so o som do PC");
         o.Altura = 0; o.Codificador = "libx264";
         Ok(Replay.Filtro(o).EndsWith("format=yuv420p"), "x264 traz a imagem para o processador");
+        Ok(Vigia.PerdeuATela("[Parsed_ddagrab_0 @ 0000021a4a234500] AcquireNextFrame failed: 887a0026") &&
+           !Vigia.PerdeuATela("frame=120"), "reconhece a perda da tela (BlueStacks)");
 
         // escolha dos pedacos do anel
         string anel = Path.Combine(saida, "anel");
         if (Directory.Exists(anel)) Directory.Delete(anel, true);
         Directory.CreateDirectory(anel);
         DateTime t0 = DateTime.UtcNow.AddSeconds(-20);
-        Pedaco(anel, "seg0000.ts", t0.AddSeconds(-30));   // sobra da volta anterior do anel
-        for (int i = 5; i <= 9; i++) Pedaco(anel, "seg" + i.ToString("0000") + ".ts", t0.AddSeconds(i));
-        File.WriteAllText(Path.Combine(anel, "lista.csv"), "seg0005.ts,5.0,6.0\nseg0006.ts,6.0,7.0\nseg0007.ts,7.0,8.0\nseg0008.ts,8.0,9.0\n");
+        Pedaco(anel, "s00001_0000.ts", t0.AddSeconds(-30));   // sobra da volta anterior do anel
+        for (int i = 5; i <= 9; i++) Pedaco(anel, "s00001_" + i.ToString("0000") + ".ts", t0.AddSeconds(i));
+        string l1 = Path.Combine(anel, "lista_s00001.csv");
+        File.WriteAllText(l1, "s00001_0005.ts,5.0,6.0\ns00001_0006.ts,6.0,7.0\ns00001_0007.ts,7.0,8.0\ns00001_0008.ts,8.0,9.0\n");
         List<string> p = Replay.EscolherPedacos(anel, 3, 10);
-        Ok(string.Join("|", p.ToArray()) == "seg0006.ts|seg0007.ts|seg0008.ts|seg0009.ts", "ultimos 3 prontos + o que esta gravando: " + string.Join("|", p.ToArray()));
-        File.AppendAllText(Path.Combine(anel, "lista.csv"), "seg0009.ts,9.0,10.0\n");
+        Ok(string.Join("|", p.ToArray()) == "s00001_0006.ts|s00001_0007.ts|s00001_0008.ts|s00001_0009.ts", "ultimos 3 prontos + o que esta gravando: " + string.Join("|", p.ToArray()));
+        File.AppendAllText(l1, "s00001_0009.ts,9.0,10.0\n");
         p = Replay.EscolherPedacos(anel, 3, 10);
-        Ok(string.Join("|", p.ToArray()) == "seg0007.ts|seg0008.ts|seg0009.ts", "nao emenda a sobra velha do anel: " + string.Join("|", p.ToArray()));
-        File.Delete(Path.Combine(anel, "lista.csv"));
+        Ok(string.Join("|", p.ToArray()) == "s00001_0007.ts|s00001_0008.ts|s00001_0009.ts", "nao emenda a sobra velha do anel: " + string.Join("|", p.ToArray()));
+
+        // a captura caiu e voltou numa sessao nova: o clipe passa pelas duas
+        Pedaco(anel, "s00002_0000.ts", t0.AddSeconds(11));
+        File.WriteAllText(Path.Combine(anel, "lista_s00002.csv"), "");
+        p = Replay.EscolherPedacos(anel, 3, 10);
+        Ok(string.Join("|", p.ToArray()) == "s00001_0007.ts|s00001_0008.ts|s00001_0009.ts|s00002_0000.ts", "sessao nova acabou de comecar: " + string.Join("|", p.ToArray()));
+        Pedaco(anel, "s00002_0001.ts", t0.AddSeconds(12));
+        File.WriteAllText(Path.Combine(anel, "lista_s00002.csv"), "s00002_0000.ts,0.0,1.0\n");
+        p = Replay.EscolherPedacos(anel, 3, 10);
+        Ok(string.Join("|", p.ToArray()) == "s00001_0008.ts|s00001_0009.ts|s00002_0000.ts|s00002_0001.ts", "emenda as duas sessoes: " + string.Join("|", p.ToArray()));
+        Pedaco(anel, "s00000_0003.ts", t0.AddSeconds(-60));   // sessao bem velha
+        File.WriteAllText(Path.Combine(anel, "lista_s00000.csv"), "s00000_0003.ts,3.0,4.0\n");
+        p = Replay.EscolherPedacos(anel, 10, 10);
+        Ok(!p.Contains("s00000_0003.ts"), "pedaco velho demais nao entra no clipe: " + string.Join("|", p.ToArray()));
+        Replay.LimparAnel(anel, 3, true);
+        Ok(!File.Exists(Path.Combine(anel, "s00000_0003.ts")) && !File.Exists(Path.Combine(anel, "lista_s00000.csv")) &&
+           File.Exists(Path.Combine(anel, "s00002_0001.ts")), "limpeza tira so a sessao velha");
+        foreach (string f in Directory.GetFiles(anel, "lista_*.csv")) File.Delete(f);
         Ok(Replay.EscolherPedacos(anel, 3, 10).Count == 0, "sem lista, sem pedacos");
 
         Ok(Miniaturas.LerDuracao("  Duration: 00:01:05.60, start: 0") == "1:06", "duracao 1:06");
@@ -698,6 +721,9 @@ static class Teste
             string d = Miniaturas.LerDuracao(s);
             Ok(s.Contains("Video: h264") && s.Contains("Audio: aac"), "clipe tem video h264 e som aac");
             Ok(d == "0:06" || d == "0:07" || d == "0:08" || d == "0:09", "clipe curto tem o tempo gravado ate agora: " + d);
+            string erros;
+            int cod = Ffmpeg.Rodar("-hide_banner -v error -i " + Ffmpeg.Aspas(feitos[0]) + " -f null -", null, 60000, out erros);
+            Ok(cod == 0 && string.IsNullOrEmpty(erros.Trim()), "fim do clipe sem quadro cortado: " + erros);
         }
 
         // passou da duracao: o clipe fica com 15 s (+ o pedaco em andamento)
@@ -710,9 +736,11 @@ static class Teste
         {
             Array.Sort(feitos);
             string d = Miniaturas.LerDuracao(Sondar(feitos[1]));
-            Ok(d == "0:15" || d == "0:16", "clipe longo limitado a 15 s: " + d);
+            // 15 pedacos; se o Windows tirar a tela no meio (Alt+Tab num jogo), o
+            // clipe passa pelo buraco e fica um pouco mais longo que 15 s
+            Ok(d == "0:15" || d == "0:16" || d == "0:17" || d == "0:18", "clipe longo limitado a 15 s: " + d);
         }
-        string[] anel = Directory.GetFiles(ConfigClipe.PastaAnel, "seg*.ts");
+        string[] anel = Directory.GetFiles(ConfigClipe.PastaAnel, "s*_*.ts");
         Ok(anel.Length <= 15 + Replay.Folga, "anel nao passa do limite: " + anel.Length + " pedacos");
 
         Process p = null;
@@ -740,6 +768,8 @@ static class Teste
         ConfigClipe.SomPc = true;
         ConfigClipe.Microfone = false;
         ConfigClipe.Ligado = true;
+        // Anel vazio: o clipe abaixo tem de ter so o desta sessao e o da seguinte
+        foreach (string f in Directory.GetFiles(ConfigClipe.PastaAnel)) try { File.Delete(f); } catch { }
         WindowsFormsSynchronizationContext ctx = new WindowsFormsSynchronizationContext();
         System.Threading.SynchronizationContext.SetSynchronizationContext(ctx);
         Replay.Preparar(ctx);
@@ -753,9 +783,58 @@ static class Teste
         Ok(Esperar(delegate { return Replay.Gravando; }, 20000), "replay voltou sozinho");
         Process novo = FfmpegMaisNovo();
         Ok(novo != null && novo.Id != velho.Id && velho.WaitForExit(3000), "ffmpeg travado foi fechado e outro abriu");
+        Console.WriteLine("voltou em " + sw.ElapsedMilliseconds + " ms");
+        Ok(sw.ElapsedMilliseconds < 6000, "voltou rapido (antes levava ~7 s): " + sw.ElapsedMilliseconds + " ms");
         Esperar(delegate { return false; }, 3000);
+        DateTime antesDeSalvar = DateTime.Now;
         Replay.SalvarClipe();
         Esperar(delegate { return !Replay.Salvando; }, 30000);
+        // O anel nao recomeca: o clipe tem os ~3 s de antes do travamento e os ~3 s depois
+        string feito = null;
+        foreach (string f in Directory.GetFiles(ConfigClipe.Pasta, "clipe-*.mp4"))
+            if (File.GetLastWriteTime(f) >= antesDeSalvar.AddSeconds(-1)) feito = f;
+        Ok(feito != null, "clipe salvo depois do travamento");
+        if (feito != null)
+        {
+            string s = Sondar(feito);
+            string d = Miniaturas.LerDuracao(s);
+            Console.WriteLine("clipe emendado: " + d);
+            Ok(s.Contains("Video: h264") && s.Contains("Audio: aac"), "clipe emendado tem video e som");
+            Ok(d != null && string.CompareOrdinal(d, "0:06") >= 0 && string.CompareOrdinal(d, "0:12") <= 0,
+               "clipe passa pelas duas sessoes (nao so os 3 s depois): " + d);
+            string erros;
+            int cod = Ffmpeg.Rodar("-hide_banner -v error -i " + Ffmpeg.Aspas(feito) + " -f null -", null, 60000, out erros);
+            Ok(cod == 0 && string.IsNullOrEmpty(erros.Trim()), "clipe emendado decodifica sem erro: " + erros);
+        }
+
+        // Perdeu a tela (o que o BlueStacks faz): pelo caminho da linha de erro
+        Process antes2 = FfmpegMaisNovo();
+        Replay.SimularPerdaDaTela();
+        sw.Restart();
+        Ok(Esperar(delegate { return Replay.Gravando && FfmpegMaisNovo() != null && FfmpegMaisNovo().Id != antes2.Id; }, 10000), "perdeu a tela e voltou");
+        Console.WriteLine("perda da tela: voltou em " + sw.ElapsedMilliseconds + " ms");
+        Ok(sw.ElapsedMilliseconds < 3000, "perda da tela volta em menos de 3 s: " + sw.ElapsedMilliseconds + " ms");
+
+        // O pedaco que a sessao derrubada gravava entrou na lista, sem o quadro cortado
+        string[] listas = Directory.GetFiles(ConfigClipe.PastaAnel, "lista_s*.csv");
+        bool salvouOResto = false;
+        foreach (string l in listas) if (File.ReadAllText(l).Contains(",0,0")) salvouOResto = true;
+        Ok(salvouOResto, "o segundo antes da queda nao se perde");
+        Esperar(delegate { return false; }, 2000);
+        antesDeSalvar = DateTime.Now;
+        Replay.SalvarClipe();
+        Esperar(delegate { return !Replay.Salvando; }, 30000);
+        feito = null;
+        foreach (string f in Directory.GetFiles(ConfigClipe.Pasta, "clipe-*.mp4"))
+            if (File.GetLastWriteTime(f) >= antesDeSalvar.AddSeconds(-1)) feito = f;
+        Ok(feito != null, "clipe salvo depois da perda da tela");
+        if (feito != null)
+        {
+            string erros;
+            int cod = Ffmpeg.Rodar("-hide_banner -v error -i " + Ffmpeg.Aspas(feito) + " -f null -", null, 60000, out erros);
+            Ok(cod == 0 && string.IsNullOrEmpty(erros.Trim()), "clipe com a perda da tela decodifica sem erro: " + erros);
+            Console.WriteLine("clipe com 3 sessoes: " + Miniaturas.LerDuracao(Sondar(feito)));
+        }
         Replay.Parar();
     }
 
@@ -777,21 +856,34 @@ static class Teste
             Ok(s.Contains("Video: h264") && s.Contains("Audio: aac"), "gravacao tem video e som");
             Ok(d == "0:05" || d == "0:06" || d == "0:07", "gravacao tem o tempo gravado: " + d);
         }
-        Ok(Directory.GetFiles(Gravacao.PastaTemp).Length == 0, "nao sobrou .mkv temporario");
+        Ok(Directory.GetFileSystemEntries(Gravacao.PastaTemp).Length == 0, "nao sobrou parte temporaria");
 
-        // travou no meio: salva o que tem e continua num arquivo novo
+        // travou no meio: continua numa parte nova e, no fim, sai um video so
         foreach (string f in Directory.GetFiles(clipes, "gravacao-*")) File.Delete(f);
         Gravacao.Iniciar(false);
         Ok(Esperar(delegate { return Gravacao.Ativa; }, 20000), "segunda gravacao iniciou");
         Esperar(delegate { return false; }, 3000);
         NtSuspendProcess(FfmpegMaisNovo().Handle);
+        Stopwatch sw = Stopwatch.StartNew();
         Ok(Esperar(delegate { return Gravacao.Parando || !Gravacao.Ativa; }, 9000), "vigia da gravacao percebeu");
         Ok(Esperar(delegate { return Gravacao.Ativa && !Gravacao.Parando; }, 30000), "gravacao continuou sozinha");
+        Console.WriteLine("gravacao voltou em " + sw.ElapsedMilliseconds + " ms");
+        Ok(sw.ElapsedMilliseconds < 7000, "gravacao volta rapido (nao espera o \"q\" de um ffmpeg congelado): " + sw.ElapsedMilliseconds + " ms");
         Esperar(delegate { return false; }, 3000);
         Gravacao.Parar();
         Esperar(delegate { return !Gravacao.Parando; }, 30000);
         string[] partes = Directory.GetFiles(clipes, "gravacao-*");
-        Ok(partes.Length == 2, "duas partes salvas: " + partes.Length);
+        Ok(partes.Length == 1 && partes[0].EndsWith(".mp4"), "um video so, com as duas partes: " + partes.Length);
+        if (partes.Length == 1)
+        {
+            string s = Sondar(partes[0]);
+            string d = Miniaturas.LerDuracao(s);
+            Ok(d != null && string.CompareOrdinal(d, "0:06") >= 0 && string.CompareOrdinal(d, "0:13") <= 0, "video tem as duas partes: " + d);
+            string erros;
+            int cod = Ffmpeg.Rodar("-hide_banner -v error -i " + Ffmpeg.Aspas(partes[0]) + " -f null -", null, 60000, out erros);
+            Ok(cod == 0 && string.IsNullOrEmpty(erros.Trim()), "gravacao emendada decodifica sem erro: " + erros);
+        }
+        Ok(Directory.GetFileSystemEntries(Gravacao.PastaTemp).Length == 0, "partes apagadas depois de juntar");
         foreach (string f in Directory.GetFiles(clipes, "gravacao-*")) File.Delete(f);
     }
 

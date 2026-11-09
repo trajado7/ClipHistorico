@@ -1756,6 +1756,7 @@ class TelaRecorte : Form
 
     protected override void OnPaint(PaintEventArgs e)
     {
+        if (solta || IsDisposed) return;
         Graphics g = e.Graphics;
         Rectangle c = e.ClipRectangle;
         g.CompositingMode = CompositingMode.SourceCopy;
@@ -1836,14 +1837,19 @@ class TelaRecorte : Form
         return base.ProcessCmdKey(ref msg, k);
     }
 
+    // A janela some primeiro: soltar a foto antes deixava um WM_PAINT atrasado
+    // desenhar com ela ja solta ("Parametro invalido" no log, 09/11)
+    bool solta;
+
     protected override void Dispose(bool disposing)
     {
-        if (disposing)
+        base.Dispose(disposing);
+        if (disposing && !solta)
         {
+            solta = true;
             foto.Dispose();
             escura.Dispose();
         }
-        base.Dispose(disposing);
     }
 }
 
@@ -5940,6 +5946,17 @@ class Vigia
     // ms desde o ultimo quadro novo (conta desde a criacao, para dar tempo de iniciar)
     public long Parado { get { return relogio.ElapsedMilliseconds - Interlocked.Read(ref quando); } }
     public long Quadros { get { return Interlocked.Read(ref quadros); } }
+
+    // O Windows tirou a tela do ddagrab (erro 887a0026, DXGI_ERROR_ACCESS_LOST).
+    // Acontece quando um jogo em tela cheia ganha ou perde o foco: o BlueStacks
+    // com Vulkan faz isso a cada Alt+Tab. O ffmpeg nao fecha (segue gravando so
+    // o som), entao a linha de erro e o aviso mais rapido que existe.
+    public volatile bool TelaPerdida;
+
+    public static bool PerdeuATela(string linha)
+    {
+        return linha != null && (linha.Contains("AcquireNextFrame failed") || linha.Contains("Error during demuxing"));
+    }
 }
 
 // Se o programa fechar ou cair, o Windows fecha o ffmpeg junto
@@ -6261,7 +6278,18 @@ static class Replay
     static Timer espera, reconfigurar, vigiar;
     static Vigia vigia;
     static DateTime ultimoTravou;
-    public const int TravadoMs = 5000;   // sem quadro novo por esse tempo = captura travada
+    public const int TravadoMs = 2500;   // sem quadro novo por esse tempo = captura travada (o ffmpeg conta a cada 1 s)
+
+    // O anel sobrevive aos reinicios: cada ffmpeg (sessao) grava pedacos com o
+    // proprio nome e o relogio continua de onde o anterior parou
+    // (-output_ts_offset). Assim o clipe emenda as sessoes com um salto de
+    // menos de 1 s no lugar da queda, em vez de perder tudo o que tinha.
+    // So comeca do zero quando o formato do video muda (monitor, resolucao...).
+    static readonly Stopwatch relogioAnel = new Stopwatch();
+    static readonly object travaAnel = new object();
+    static string assinaturaAnel;
+    static int sessaoAtual = -1;
+    static DateTime ultimaLimpeza;
     static Process proc, morrendo;
     static SomCaptura somPc, somMic;
     static int geracao, falhas, anel;
@@ -6287,28 +6315,51 @@ static class Replay
         vigiar.Interval = 1000;
         vigiar.Tick += delegate
         {
-            if (Gravando && vigia != null && vigia.Parado > TravadoMs) Travou();
+            if (Gravando && vigia != null && (vigia.TelaPerdida || vigia.Parado > TravadoMs)) Travou();
             Gravacao.Vigiar();
+            if ((DateTime.Now - ultimaLimpeza).TotalSeconds >= 5)
+            {
+                ultimaLimpeza = DateTime.Now;
+                int seg = SegundosAtuais;
+                ThreadPool.QueueUserWorkItem(delegate { LimparAnel(ConfigClipe.PastaAnel, seg, false); });
+            }
         };
         vigiar.Start();
         if (ConfigClipe.Ligado) Iniciar();
     }
 
-    // A captura parou sem o ffmpeg fechar: reinicia na hora (o anel recomeca)
+    // A captura parou sem o ffmpeg fechar: reinicia na hora. O anel continua.
     static bool Travou()
     {
         string saida;
         lock (linhas) saida = string.Join("\n", linhas.ToArray());
-        App.Log("Replay travou (" + (vigia == null ? -1 : vigia.Quadros) + " quadros): " + saida);
+        bool perdida = vigia != null && vigia.TelaPerdida;
+        App.Log("Replay " + (perdida ? "perdeu a tela" : "travou") + " (" + (vigia == null ? -1 : vigia.Quadros) + " quadros): " + saida);
+        bool rapida = (DateTime.Now - inicio).TotalSeconds < 3;   // caiu logo depois de abrir: nao insiste sem pausa
         Parar();
-        Problema = "a captura da tela travou e foi reiniciada";
-        if ((DateTime.Now - ultimoTravou).TotalSeconds > 60)
-            Aviso.Mostrar("Replay reiniciado", "A captura da tela travou (um jogo mudou o modo da tela?)", Tema.Suave);
-        ultimoTravou = DateTime.Now;
-        if (espera != null) { espera.Interval = 1000; espera.Start(); }
+        // Perder a tela e normal (Alt+Tab num jogo em tela cheia): volta calado
+        if (!perdida)
+        {
+            Problema = "a captura da tela travou e foi reiniciada";
+            if ((DateTime.Now - ultimoTravou).TotalSeconds > 60)
+                Aviso.Mostrar("Replay reiniciado", "A captura da tela travou (um jogo mudou o modo da tela?)", Tema.Suave);
+            ultimoTravou = DateTime.Now;
+        }
+        if (espera != null) { espera.Interval = rapida ? 1000 : 30; espera.Start(); }
         Avisar();
         return true;
     }
+
+#if TESTE
+    // Faz de conta que o ffmpeg escreveu o erro do ddagrab (887a0026)
+    public static void SimularPerdaDaTela()
+    {
+        Vigia v = vigia;
+        if (v == null) return;
+        v.TelaPerdida = true;
+        NaJanela(delegate { if (Gravando && vigia == v) Travou(); });
+    }
+#endif
 
     static void Avisar() { if (Mudou != null) Mudou(); }
     public static void Notificar() { Avisar(); }   // a gravacao tambem avisa a galeria
@@ -6426,18 +6477,21 @@ static class Replay
         bool pc = ConfigClipe.SomPc, mic = ConfigClipe.Microfone;
         Process velho = morrendo;
         morrendo = null;
+        int sessaoVelha = sessaoAtual, anelVelho = anel;
 
-        Thread t = new Thread(delegate() { Preparo(g, o, tela, pc, mic, velho); });
+        Thread t = new Thread(delegate() { Preparo(g, o, tela, pc, mic, velho, sessaoVelha, anelVelho); });
         t.IsBackground = true;
         t.Start();
     }
 
-    static void Preparo(int g, Opcoes o, Screen tela, bool comPc, bool comMic, Process velho)
+    static void Preparo(int g, Opcoes o, Screen tela, bool comPc, bool comMic, Process velho, int sessaoVelha, int anelVelho)
     {
         SomCaptura pc = null, mic = null;
         try
         {
-            if (velho != null) { try { velho.WaitForExit(3000); velho.Dispose(); } catch { } }
+            bool fechou = true;
+            if (velho != null) { try { fechou = velho.WaitForExit(3000); velho.Dispose(); } catch { } }
+            if (fechou) lock (travaAnel) FecharSessao(ConfigClipe.PastaAnel, sessaoVelha, anelVelho);
             if (Ffmpeg.Caminho == null) { Falhou(g, "falta o ffmpeg, que grava a tela (baixe em Configurações)", false, true); return; }
 
             o.Monitor = Math.Max(0, Dxgi.IndiceDoMonitor(tela.DeviceName));
@@ -6449,14 +6503,29 @@ static class Replay
             }
 
             Directory.CreateDirectory(ConfigClipe.PastaAnel);
-            foreach (string f in Directory.GetFiles(ConfigClipe.PastaAnel))
-                try { File.Delete(f); } catch { }
 
             int pid = Process.GetCurrentProcess().Id;
             if (comPc) pc = AbrirSom(false, "TrajadoTools-pc-" + pid + "-" + g);
             if (comMic) mic = AbrirSom(true, "TrajadoTools-mic-" + pid + "-" + g);
 
-            string args = Ffmpeg.ArgsProgresso + MontarArgs(o, pc == null ? null : pc.Entrada, mic == null ? null : mic.Entrada);
+            // Mesmo formato de video e de som = a sessao nova emenda na anterior
+            string assinatura = tela.Bounds.Width + "x" + tela.Bounds.Height + "|" + o.Monitor + "|" + o.Altura + "|" + o.Fps + "|" +
+                                o.Codificador + "|" + (pc != null) + "|" + (mic != null);
+            double deslocamento;
+            lock (travaAnel)
+            {
+                if (assinatura != assinaturaAnel)
+                {
+                    foreach (string f in Directory.GetFiles(ConfigClipe.PastaAnel))
+                        try { File.Delete(f); } catch { }
+                    assinaturaAnel = assinatura;
+                    relogioAnel.Restart();
+                }
+                else LimparAnel(ConfigClipe.PastaAnel, o.Segundos, true);
+                deslocamento = relogioAnel.Elapsed.TotalSeconds;
+            }
+
+            string args = Ffmpeg.ArgsProgresso + MontarArgs(o, pc == null ? null : pc.Entrada, mic == null ? null : mic.Entrada, g, deslocamento);
             lock (linhas) linhas.Clear();
             Process p = new Process();
             p.StartInfo = Ffmpeg.Info(args, ConfigClipe.PastaAnel);
@@ -6467,6 +6536,11 @@ static class Replay
             {
                 if (string.IsNullOrEmpty(e.Data)) return;
                 lock (linhas) { linhas.Add(e.Data); if (linhas.Count > 12) linhas.RemoveAt(0); }
+                if (!v.TelaPerdida && Vigia.PerdeuATela(e.Data))
+                {
+                    v.TelaPerdida = true;
+                    NaJanela(delegate { if (Gravando && vigia == v) Travou(); });
+                }
             };
             p.Exited += delegate { NaJanela(delegate { Terminou(g, p); }); };
             p.Start();
@@ -6498,12 +6572,14 @@ static class Replay
                 Codificador = o.Codificador;
                 SegundosAtuais = o.Segundos;
                 anel = o.Segundos + Folga;
+                sessaoAtual = g;
                 descricao = desc;
                 Iniciando = false;
                 if (p.HasExited) { Terminou(g, p); return; }
                 Gravando = true;
                 inicio = DateTime.Now;
                 Avisar();
+                if (v.TelaPerdida) Travou();   // perdeu a tela antes de chegar aqui
             });
         }
         catch (Exception ex)
@@ -6518,6 +6594,8 @@ static class Replay
     static void Terminou(int g, Process p)
     {
         if (g != geracao || proc != p) return;
+        // Sem som, o video e a unica entrada e o ffmpeg fecha ao perder a tela: volta na hora
+        if (vigia != null && vigia.TelaPerdida) { Travou(); return; }
         string saida;
         lock (linhas) saida = string.Join("\n", linhas.ToArray());
         int codigo = 0;
@@ -6675,63 +6753,193 @@ static class Replay
         return a.ToString();
     }
 
-    public static string MontarArgs(Opcoes o, string entradaPc, string entradaMic)
+    // Nomes dos arquivos de uma sessao do anel: s00007_0012.ts e lista_s00007.csv
+    public static string NomeSessao(int sessao) { return "s" + sessao.ToString("00000"); }
+    public static string ListaDaSessao(int sessao) { return "lista_" + NomeSessao(sessao) + ".csv"; }
+
+    public static string MontarArgs(Opcoes o, string entradaPc, string entradaMic, int sessao, double deslocamento)
     {
         StringBuilder a = new StringBuilder(ArgsCaptura(o, entradaPc, entradaMic, false));
         a.Append("-force_key_frames \"expr:gte(t,n_forced*1)\" ");
+        // O relogio desta sessao continua de onde o anel estava: emendar com as anteriores nao volta no tempo
+        if (deslocamento > 0)
+            a.Append("-output_ts_offset ").Append(deslocamento.ToString("0.000", CultureInfo.InvariantCulture)).Append(' ');
         int n = o.Segundos + Folga;
         a.Append("-f segment -segment_time 1 -segment_wrap ").Append(n)
-         .Append(" -segment_list lista.csv -segment_list_type csv -segment_list_size ").Append(n)
-         .Append(" -segment_format mpegts -max_muxing_queue_size 4096 seg%04d.ts");
+         .Append(" -segment_list ").Append(ListaDaSessao(sessao)).Append(" -segment_list_type csv -segment_list_size ").Append(n)
+         .Append(" -segment_format mpegts -max_muxing_queue_size 4096 ").Append(NomeSessao(sessao)).Append("_%04d.ts");
         return a.ToString();
     }
 
-    // Os ultimos pedacos prontos, em ordem, mais o que esta sendo gravado agora
-    public static List<string> EscolherPedacos(string pasta, int segundos, int tamanhoAnel)
+    // Sessoes que tem lista no anel, da mais velha para a mais nova
+    static List<int> Sessoes(string pasta)
     {
-        List<string> nomes = new List<string>();
+        List<int> r = new List<int>();
+        try
+        {
+            foreach (string f in Directory.GetFiles(pasta, "lista_s*.csv"))
+            {
+                string n = Path.GetFileNameWithoutExtension(f);
+                int s;
+                if (int.TryParse(n.Substring(7), out s)) r.Add(s);
+            }
+        }
+        catch { }
+        r.Sort();
+        return r;
+    }
+
+    static string LerLista(string arquivo)
+    {
         string texto = null;
         for (int t = 0; t < 5 && string.IsNullOrEmpty(texto); t++)
         {
             try
             {
-                using (FileStream f = new FileStream(Path.Combine(pasta, "lista.csv"), FileMode.Open, FileAccess.Read,
-                                                     FileShare.ReadWrite | FileShare.Delete))
+                using (FileStream f = new FileStream(arquivo, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
                 using (StreamReader r = new StreamReader(f))
                     texto = r.ReadToEnd();
             }
+            catch (FileNotFoundException) { return null; }
             catch { }
             if (string.IsNullOrEmpty(texto)) Thread.Sleep(40);
         }
-        if (string.IsNullOrEmpty(texto)) return nomes;
+        return texto;
+    }
 
-        foreach (string l in texto.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
-        {
-            int v = l.IndexOf(',');
-            string n = (v > 0 ? l.Substring(0, v) : l).Trim();
-            if (n.StartsWith("seg") && n.EndsWith(".ts") && File.Exists(Path.Combine(pasta, n))) nomes.Add(n);
-        }
-        if (nomes.Count > segundos) nomes.RemoveRange(0, nomes.Count - segundos);
+    // Os ultimos pedacos prontos, em ordem (passando por todas as sessoes que
+    // ainda estao no anel), mais o que esta sendo gravado agora
+    public static List<string> EscolherPedacos(string pasta, int segundos, int tamanhoAnel)
+    {
+        List<string> nomes = new List<string>();
+        List<int> sessoes = Sessoes(pasta);
+        string ultimoPronto = null;
+        int ultimaSessao = sessoes.Count > 0 ? sessoes[sessoes.Count - 1] : -1;
+        List<string> daUltima = new List<string>();
+        // Mais velho que isso a limpeza pode apagar durante o salvamento (ela usa + 10 s)
+        DateTime velho = DateTime.UtcNow.AddSeconds(-(segundos + Folga + 5));
 
-        // O proximo do anel e o que esta sendo gravado, se for mais novo que o ultimo pronto
-        if (nomes.Count > 0)
+        foreach (int s in sessoes)
         {
-            string ult = nomes[nomes.Count - 1];
-            int num;
-            if (int.TryParse(ult.Substring(3, ult.Length - 6), out num))
+            string texto = LerLista(Path.Combine(pasta, ListaDaSessao(s)));
+            if (string.IsNullOrEmpty(texto)) continue;
+            string pre = NomeSessao(s) + "_";
+            foreach (string l in texto.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
             {
-                string prox = "seg" + ((num + 1) % tamanhoAnel).ToString("0000") + ".ts";
-                string cp = Path.Combine(pasta, prox), cu = Path.Combine(pasta, ult);
-                try
-                {
-                    if (File.Exists(cp) && new FileInfo(cp).Length > 0 &&
-                        File.GetLastWriteTimeUtc(cp) >= File.GetLastWriteTimeUtc(cu).AddMilliseconds(-500))
-                        nomes.Add(prox);
-                }
-                catch { }
+                int v = l.IndexOf(',');
+                string n = (v > 0 ? l.Substring(0, v) : l).Trim();
+                if (!n.StartsWith(pre) || !n.EndsWith(".ts")) continue;
+                string c = Path.Combine(pasta, n);
+                if (!File.Exists(c)) continue;
+                if (s == ultimaSessao) daUltima.Add(n);
+                try { if (File.GetLastWriteTimeUtc(c) < velho) continue; } catch { continue; }
+                nomes.Add(n);
             }
         }
+        if (nomes.Count > 0) ultimoPronto = nomes[nomes.Count - 1];
+        if (nomes.Count > segundos) nomes.RemoveRange(0, nomes.Count - segundos);
+
+        // O pedaco que a sessao mais nova esta gravando: o seguinte ao ultimo
+        // pronto dela (ou o primeiro, se ela acabou de comecar), se for mais novo
+        if (ultimaSessao >= 0)
+        {
+            int prox = 0;
+            if (daUltima.Count > 0)
+            {
+                string u = daUltima[daUltima.Count - 1];
+                int num;
+                if (!int.TryParse(u.Substring(u.Length - 7, 4), out num)) return nomes;
+                prox = (num + 1) % tamanhoAnel;
+            }
+            string nome = NomeSessao(ultimaSessao) + "_" + prox.ToString("0000") + ".ts";
+            string cp = Path.Combine(pasta, nome);
+            try
+            {
+                if (File.Exists(cp) && new FileInfo(cp).Length > 0 && !nomes.Contains(nome) &&
+                    (ultimoPronto == null ||
+                     File.GetLastWriteTimeUtc(cp) >= File.GetLastWriteTimeUtc(Path.Combine(pasta, ultimoPronto)).AddMilliseconds(-500)))
+                    nomes.Add(nome);
+            }
+            catch { }
+        }
         return nomes;
+    }
+
+    // A sessao acabou a forca (perdeu a tela, travou): o pedaco que ela estava
+    // gravando tem o ultimo segundo antes da queda, que pode ser o fim da
+    // jogada. Com o ffmpeg ja fechado, acerta o fim dele e o poe na lista.
+    public static void FecharSessao(string pasta, int sessao, int tamanhoAnel)
+    {
+        if (sessao < 0 || tamanhoAnel <= 0) return;
+        try
+        {
+            string lista = Path.Combine(pasta, ListaDaSessao(sessao));
+            string texto = (File.Exists(lista) ? LerLista(lista) : null) ?? "";
+            string ultimo = null;
+            foreach (string l in texto.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                int v = l.IndexOf(',');
+                ultimo = (v > 0 ? l.Substring(0, v) : l).Trim();
+            }
+            int prox = 0, num;
+            if (ultimo != null)
+            {
+                if (ultimo.Length < 11 || !int.TryParse(ultimo.Substring(ultimo.Length - 7, 4), out num)) return;
+                prox = (num + 1) % tamanhoAnel;
+            }
+            string nome = NomeSessao(sessao) + "_" + prox.ToString("0000") + ".ts";
+            string c = Path.Combine(pasta, nome);
+            if (!File.Exists(c) || new FileInfo(c).Length < 188 * 20 || texto.Contains(nome + ",")) return;
+            // Mais velho que o ultimo pronto = sobra da volta anterior do anel
+            if (ultimo != null && File.Exists(Path.Combine(pasta, ultimo)) &&
+                File.GetLastWriteTimeUtc(c) < File.GetLastWriteTimeUtc(Path.Combine(pasta, ultimo))) return;
+            Gravacao.CortarQuadroIncompleto(c);
+            File.AppendAllText(lista, (texto.Length > 0 && !texto.EndsWith("\n") ? "\n" : "") + nome + ",0,0\n");
+        }
+        catch (Exception ex) { App.Log("Erro ao fechar a sessao do replay: " + ex.Message); }
+    }
+
+    // O pedaco ja esta pronto (o ffmpeg o pos na lista da sessao dele)?
+    public static bool Listado(string pasta, string pedaco)
+    {
+        int s;
+        if (pedaco.Length < 7 || !int.TryParse(pedaco.Substring(1, 5), out s)) return false;
+        string texto = LerLista(Path.Combine(pasta, ListaDaSessao(s)));
+        if (string.IsNullOrEmpty(texto)) return false;
+        foreach (string l in texto.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+            if (l.StartsWith(pedaco + ",") || l.Trim() == pedaco) return true;
+        return false;
+    }
+
+    // Tira do anel as sessoes velhas: pedacos mais antigos que a duracao do
+    // clipe (com folga) nunca entram num clipe. A sessao que esta gravando
+    // agora so perde o que o proprio ffmpeg ja deixou para tras.
+    public static void LimparAnel(string pasta, int segundos, bool tambemAtual)
+    {
+        try
+        {
+            if (!Directory.Exists(pasta)) return;
+            DateTime limite = DateTime.UtcNow.AddSeconds(-(segundos + Folga + 10));
+            string atual = sessaoAtual >= 0 && !tambemAtual ? NomeSessao(sessaoAtual) + "_" : null;
+            foreach (string f in Directory.GetFiles(pasta, "s*_*.ts"))
+            {
+                string n = Path.GetFileName(f);
+                if (atual != null && n.StartsWith(atual)) continue;
+                try { if (File.GetLastWriteTimeUtc(f) < limite) File.Delete(f); } catch { }
+            }
+            // Lista sem nenhum pedaco = sessao acabou
+            foreach (int s in Sessoes(pasta))
+            {
+                if (s == sessaoAtual) continue;
+                if (Directory.GetFiles(pasta, NomeSessao(s) + "_*.ts").Length == 0)
+                    try { File.Delete(Path.Combine(pasta, ListaDaSessao(s))); } catch { }
+            }
+            // Sobras da versao antiga do anel
+            foreach (string f in Directory.GetFiles(pasta, "seg*.ts")) try { File.Delete(f); } catch { }
+            string velha = Path.Combine(pasta, "lista.csv");
+            if (File.Exists(velha)) try { File.Delete(velha); } catch { }
+        }
+        catch { }
     }
 
     public static string CaminhoNovo(string prefixo = "clipe-", string ext = ".mp4")
@@ -6753,27 +6961,24 @@ static class Replay
     // ---- Salvar ----
     public static void SalvarClipe()
     {
-        if (!Gravando)
+        if (!ConfigClipe.Ligado)
         {
-            if (ConfigClipe.Ligado)
-                Aviso.Mostrar("O replay não está gravando", Iniciando ? "Ainda está iniciando, tente de novo" : StatusLongo, Tema.Perigo);
-            else
-                Aviso.Mostrar("Replay instantâneo desligado",
-                    "Ligue com " + Config.Atalhos[Config.AlternarReplay] + " ou na galeria (" + Config.Atalhos[Config.AbrirGaleria] + ")", Tema.Perigo);
+            Aviso.Mostrar("Replay instantâneo desligado",
+                "Ligue com " + Config.Atalhos[Config.AlternarReplay] + " ou na galeria (" + Config.Atalhos[Config.AbrirGaleria] + ")", Tema.Perigo);
             return;
         }
         if (Salvando) return;
 
-        // Travada, o anel so tem imagem velha: salvar daria um clipe de minutos atras
-        if (vigia != null && vigia.Parado > 2500)
+        // Travada sem o ffmpeg fechar: reinicia, e o que foi gravado antes continua no anel
+        if (Gravando && vigia != null && (vigia.TelaPerdida || vigia.Parado > 2000)) Travou();
+
+        // Reiniciando (acabou de perder a tela): salva o que o anel tem
+        List<string> pedacos = SegundosAtuais > 0 ? EscolherPedacos(ConfigClipe.PastaAnel, SegundosAtuais, anel) : new List<string>();
+        if (!Gravando && pedacos.Count == 0)
         {
-            Travou();
-            Aviso.Mostrar("A captura da tela tinha travado",
-                "O replay reiniciou agora. Os segundos anteriores não foram gravados.", Tema.Perigo);
+            Aviso.Mostrar("O replay não está gravando", Iniciando ? "Ainda está iniciando, tente de novo" : StatusLongo, Tema.Perigo);
             return;
         }
-
-        List<string> pedacos = EscolherPedacos(ConfigClipe.PastaAnel, SegundosAtuais, anel);
         if (pedacos.Count == 0)
         {
             Aviso.Mostrar("Ainda não há o que salvar", "O replay acabou de começar", Tema.Suave);
@@ -6784,13 +6989,29 @@ static class Replay
 
         string destino = CaminhoNovo();
         bool hevc = Codificador != null && Codificador.StartsWith("hevc");
-        string args = "-hide_banner -loglevel error -nostdin -y -i \"concat:" + string.Join("|", pedacos.ToArray()) +
-                      "\" -map 0 -c copy " + (hevc ? "-tag:v hvc1 " : "") + "-movflags +faststart " + Ffmpeg.Aspas(destino);
-        int segundos = pedacos.Count;
+        string ultimo = pedacos[pedacos.Count - 1];
+        bool emAndamento = !Listado(ConfigClipe.PastaAnel, ultimo);
+        bool daSessaoAtual = Gravando && ultimo.StartsWith(NomeSessao(sessaoAtual) + "_");
 
         // Nao e de fundo de proposito: sair logo depois nao perde o clipe
         Thread t = new Thread(delegate()
         {
+            // O pedaco que estava sendo gravado termina no meio de um quadro (o
+            // fim do clipe saia com blocos cinza): espera ele fechar (ate ~1 s) ou,
+            // se a sessao dele ja acabou (perdeu a tela), fica de fora
+            if (emAndamento)
+            {
+                bool fechou = false;
+                for (int i = 0; daSessaoAtual && i < 30 && !fechou; i++)
+                {
+                    Thread.Sleep(50);
+                    fechou = Listado(ConfigClipe.PastaAnel, ultimo);
+                }
+                if (!fechou && pedacos.Count > 1) pedacos.RemoveAt(pedacos.Count - 1);
+            }
+            int segundos = pedacos.Count;
+            string args = "-hide_banner -loglevel error -nostdin -y -i \"concat:" + string.Join("|", pedacos.ToArray()) +
+                          "\" -map 0 -c copy " + (hevc ? "-tag:v hvc1 " : "") + "-movflags +faststart " + Ffmpeg.Aspas(destino);
             string saida = "", duracao = null;
             int cod = -3;
             try { cod = Ffmpeg.Rodar(args, ConfigClipe.PastaAnel, 60000, out saida); }
@@ -6942,8 +7163,11 @@ static class Miniaturas
     }
 }
 
-// Gravacao normal (Alt + F9): grava ate parar. Vai para um .mkv (que continua
-// tocavel se o PC desligar no meio) e, ao parar, vira .mp4 sem recodificar.
+// Gravacao normal (Alt + F9): grava ate parar. Vai em partes .ts (tocaveis
+// mesmo se o PC desligar no meio) numa pasta da sessao e, ao parar, as partes
+// viram um .mp4 so, sem recodificar. Se a captura cair (Alt+Tab num jogo em
+// tela cheia), abre outra parte com o relogio continuando: o video final fica
+// inteiro, com um salto de ~1 s no lugar da queda.
 static class Gravacao
 {
     public static bool Ativa, Iniciando, Parando;
@@ -6953,8 +7177,10 @@ static class Gravacao
     static Process proc;
     static Vigia vigia;
     static SomCaptura pc, mic;
-    static string arquivo, codificador;
-    static int geracao;
+    static string sessao, codificador;   // sessao = pasta com as partes
+    static int geracao, parte;
+    static readonly Stopwatch relogio = new Stopwatch();
+    static DateTime ultimoAvisoTravou;
     static Indicador indicador;
     static readonly List<string> linhas = new List<string>();
 
@@ -6988,6 +7214,15 @@ static class Gravacao
         Screen tela = Replay.MonitorEscolhido();
         bool comPc = ConfigClipe.SomPc, comMic = ConfigClipe.Microfone;
         int g = ++geracao;
+        if (!continuacao || sessao == null)
+        {
+            sessao = Path.Combine(PastaTemp, "gravacao-" + DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss"));
+            parte = 0;
+            relogio.Restart();
+        }
+        string pasta = sessao;
+        int numero = ++parte;
+        double deslocamento = numero == 1 ? 0 : relogio.Elapsed.TotalSeconds;
 
         Thread t = new Thread(delegate()
         {
@@ -6997,17 +7232,18 @@ static class Gravacao
                 o.Monitor = Math.Max(0, Dxgi.IndiceDoMonitor(tela.DeviceName));
                 o.Codificador = Replay.Escolher(o.Codec, o.Monitor);
                 if (o.Codificador == null) throw new Exception("a placa de vídeo não aceitou " + Replay.NomeCodec(o.Codec));
-                Directory.CreateDirectory(PastaTemp);
-                string arq = Path.Combine(PastaTemp, "gravacao-" + DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss") + ".mkv");
+                Directory.CreateDirectory(pasta);
+                string arq = Path.Combine(pasta, NomeParte(numero));
                 int pid = Process.GetCurrentProcess().Id;
                 if (comPc) a = Replay.AbrirSom(false, "TrajadoTools-gpc-" + pid + "-" + g);
                 if (comMic) m = Replay.AbrirSom(true, "TrajadoTools-gmic-" + pid + "-" + g);
 
                 string args = Ffmpeg.ArgsProgresso + Replay.ArgsCaptura(o, a == null ? null : a.Entrada, m == null ? null : m.Entrada, true) +
-                              "-f matroska " + Ffmpeg.Aspas(arq);
+                              (deslocamento > 0 ? "-output_ts_offset " + deslocamento.ToString("0.000", CultureInfo.InvariantCulture) + " " : "") +
+                              "-f mpegts " + Ffmpeg.Aspas(arq);
                 lock (linhas) linhas.Clear();
                 Process p = new Process();
-                p.StartInfo = Ffmpeg.Info(args, PastaTemp);
+                p.StartInfo = Ffmpeg.Info(args, pasta);
                 p.StartInfo.RedirectStandardInput = true;
                 Vigia v = new Vigia();
                 Ffmpeg.Vigiar(p, v);
@@ -7016,6 +7252,11 @@ static class Gravacao
                 {
                     if (string.IsNullOrEmpty(e.Data)) return;
                     lock (linhas) { linhas.Add(e.Data); if (linhas.Count > 12) linhas.RemoveAt(0); }
+                    if (!v.TelaPerdida && Vigia.PerdeuATela(e.Data))
+                    {
+                        v.TelaPerdida = true;
+                        Replay.NaJanela(delegate { if (vigia == v) Caiu(g, p, "a captura perdeu a tela"); });
+                    }
                 };
                 p.Exited += delegate { Replay.NaJanela(delegate { Caiu(g, p, null); }); };
                 p.Start();
@@ -7033,12 +7274,12 @@ static class Gravacao
                     vigia = v;
                     pc = af;
                     mic = mf;
-                    arquivo = arq;
                     codificador = o.Codificador;
                     Iniciando = false;
                     Ativa = true;
                     if (!continuacao) Inicio = DateTime.Now;
                     if (p.HasExited) { Caiu(g, p, null); return; }
+                    if (v.TelaPerdida) { Caiu(g, p, "a captura perdeu a tela"); return; }
                     if (indicador == null) { indicador = new Indicador(tela.Bounds); indicador.Show(); }
                     if (!continuacao)
                         Aviso.Mostrar("Gravação iniciada", Config.Atalhos[Config.Gravar] + " para parar", Tema.Perigo);
@@ -7055,6 +7296,8 @@ static class Gravacao
                     Iniciando = false;
                     FecharIndicador();
                     Aviso.Mostrar("Não deu para gravar", ex.Message, Tema.Perigo);
+                    // Se ja havia partes gravadas (continuacao), elas nao se perdem
+                    if (continuacao) Encerrar(ex.Message, false, true);
                     Replay.Notificar();
                 });
             }
@@ -7063,51 +7306,60 @@ static class Gravacao
         t.Start();
     }
 
+    public static string NomeParte(int n) { return "parte" + n.ToString("0000") + ".ts"; }
+
     // Chamado a cada segundo pelo replay
     public static void Vigiar()
     {
         if (indicador != null) indicador.Invalidate();
         if (Ativa) Replay.Notificar();   // tempo na galeria
-        if (Ativa && vigia != null && vigia.Parado > Replay.TravadoMs) Caiu(geracao, proc, "a captura da tela travou");
+        if (Ativa && vigia != null && (vigia.TelaPerdida || vigia.Parado > Replay.TravadoMs))
+            Caiu(geracao, proc, vigia.TelaPerdida ? "a captura perdeu a tela" : "a captura da tela travou");
     }
 
     public static void Parar() { Encerrar(null, false); }
 
-    // O ffmpeg fechou ou travou no meio: salva o que tem e, se travou, continua num arquivo novo
+    // O ffmpeg fechou ou travou no meio. Travou = continua numa parte nova, no mesmo video.
     static void Caiu(int g, Process p, string travou)
     {
         if (g != geracao || proc != p || !Ativa) return;
         string saida;
         lock (linhas) saida = string.Join("\n", linhas.ToArray());
-        App.Log("Gravacao interrompida (" + (travou ?? "ffmpeg fechou") + "): " + saida);
+        App.Log("Gravacao interrompida (" + (travou ?? "ffmpeg fechou") + ", parte " + parte + "): " + saida);
         Encerrar(travou ?? Ffmpeg.Resumo(saida) ?? "o ffmpeg fechou", travou != null);
     }
 
-    static void Encerrar(string motivo, bool continuar)
+    static void Encerrar(string motivo, bool continuar, bool jaParado = false)
     {
-        if (!Ativa) return;
+        if (!Ativa && !jaParado) return;
         geracao++;
         Ativa = false;
         Parando = true;
         Process p = proc;
         SomCaptura a = pc, m = mic;
-        string arq = arquivo, enc = codificador;
+        string pasta = sessao, enc = codificador;
+        bool perdida = motivo == "a captura perdeu a tela";
         proc = null; vigia = null; pc = null; mic = null;
-        if (!continuar) FecharIndicador();
+        if (!continuar) { FecharIndicador(); sessao = null; }
         Replay.Notificar();
 
         // Nao e de fundo: sair do programa no meio nao perde a gravacao
         Thread t = new Thread(delegate()
         {
-            Terminar(p, a, m);
-            string destino, info;
-            bool ok = Finalizar(arq, enc, out destino, out info);
+            Terminar(p, a, m, continuar && !perdida);   // congelado nao le o "q"
+            string destino = null, info = null;
+            bool ok = continuar || Finalizar(pasta, enc, out destino, out info);
             Replay.NaJanela(delegate
             {
                 Parando = false;
-                if (continuar && motivo != null)
+                if (continuar)
                 {
-                    Aviso.Mostrar("A captura travou", "O que foi gravado está salvo; a gravação continua num arquivo novo", Tema.Suave);
+                    // Perder a tela e normal (Alt+Tab num jogo em tela cheia): segue calado
+                    if (!perdida && (DateTime.Now - ultimoAvisoTravou).TotalSeconds > 60)
+                    {
+                        ultimoAvisoTravou = DateTime.Now;
+                        Aviso.Mostrar("A captura travou", "A gravação continua no mesmo vídeo", Tema.Suave);
+                    }
                     Iniciar(true);
                 }
                 else if (ok)
@@ -7124,43 +7376,105 @@ static class Gravacao
     }
 
     // "q" faz o ffmpeg fechar o arquivo direito
-    static void Terminar(Process p, SomCaptura a, SomCaptura m)
+    static void Terminar(Process p, SomCaptura a, SomCaptura m, bool matar = false)
     {
         if (p != null)
         {
-            try { if (!p.HasExited) { p.StandardInput.Write("q"); p.StandardInput.Flush(); } } catch { }
-            try { if (!p.WaitForExit(15000)) p.Kill(); } catch { }
+            if (matar) { try { if (!p.HasExited) p.Kill(); p.WaitForExit(3000); } catch { } }
+            else
+            {
+                try { if (!p.HasExited) { p.StandardInput.Write("q"); p.StandardInput.Flush(); } } catch { }
+                try { if (!p.WaitForExit(15000)) p.Kill(); } catch { }
+            }
         }
         if (a != null) a.Dispose();
         if (m != null) m.Dispose();
     }
 
-    // .mkv -> .mp4 na pasta dos clipes. Se nao der, o .mkv vai para la como esta.
-    static bool Finalizar(string arq, string enc, out string destino, out string info)
+    // Partes da sessao, em ordem, sem as vazias
+    public static List<string> Partes(string pasta)
+    {
+        List<string> r = new List<string>();
+        if (pasta == null || !Directory.Exists(pasta)) return r;
+        foreach (string f in Directory.GetFiles(pasta, "parte*.ts"))
+        {
+            try { if (new FileInfo(f).Length > 0) r.Add(Path.GetFileName(f)); } catch { }
+        }
+        r.Sort(StringComparer.OrdinalIgnoreCase);
+        return r;
+    }
+
+    // Um ffmpeg fechado a forca deixa o ultimo quadro pela metade (blocos
+    // cinza na emenda). Corta o .ts no comeco do ultimo quadro de video: o
+    // arquivo e feito de pacotes de 188 bytes e o quadro comeca num pacote com
+    // inicio de PES de video (00 00 01 E0..EF). Perder 1 quadro nao se ve.
+    public static void CortarQuadroIncompleto(string arq)
+    {
+        try
+        {
+            using (FileStream f = new FileStream(arq, FileMode.Open, FileAccess.ReadWrite))
+            {
+                long n = f.Length / 188;
+                byte[] b = new byte[188];
+                long limite = Math.Max(1, n - 100000);   // ~19 MB para tras: um quadro nunca e maior
+                for (long i = n - 1; i >= limite; i--)
+                {
+                    f.Position = i * 188;
+                    if (f.Read(b, 0, 188) != 188 || b[0] != 0x47 || (b[1] & 0x40) == 0) continue;
+                    int afc = (b[3] >> 4) & 3, p = 4;
+                    if (afc == 2 || afc == 0) continue;   // sem dados
+                    if (afc == 3) p += 1 + b[4];
+                    if (p + 4 > 188) continue;
+                    if (b[p] == 0 && b[p + 1] == 0 && b[p + 2] == 1 && b[p + 3] >= 0xE0 && b[p + 3] <= 0xEF)
+                    {
+                        f.SetLength(i * 188);
+                        return;
+                    }
+                }
+            }
+        }
+        catch (Exception ex) { App.Log("Erro ao acertar o fim da parte " + Path.GetFileName(arq) + ": " + ex.Message); }
+    }
+
+    // Partes -> um .mp4 na pasta dos clipes (o .ts aceita ser emendado byte a
+    // byte, como no replay). Se nao der, vai um .ts emendado, que tambem toca.
+    // todasCortadas = recuperando depois de o app cair (nenhuma parte fechou direito).
+    static bool Finalizar(string pasta, string enc, out string destino, out string info, bool todasCortadas = false)
     {
         destino = null;
         info = "";
         try
         {
-            if (arq == null || !File.Exists(arq) || new FileInfo(arq).Length == 0)
+            List<string> partes = Partes(pasta);
+            if (partes.Count == 0)
             {
                 info = "nada foi gravado";
-                try { if (arq != null) File.Delete(arq); } catch { }
+                try { if (pasta != null && Directory.Exists(pasta)) Directory.Delete(pasta, true); } catch { }
                 return false;
             }
-            destino = Replay.CaminhoNovo("gravacao-");
+            // So a ultima parte fechou com o "q"; as outras cairam no meio
+            for (int i = 0; i < partes.Count; i++)
+                if (todasCortadas || i < partes.Count - 1) CortarQuadroIncompleto(Path.Combine(pasta, partes[i]));
+            partes = Partes(pasta);
+            string nome = Path.GetFileName(pasta);
+            destino = Path.Combine(ConfigClipe.Pasta, nome + ".mp4");
+            Directory.CreateDirectory(ConfigClipe.Pasta);
+            for (int n = 2; File.Exists(destino); n++) destino = Path.Combine(ConfigClipe.Pasta, nome + "_" + n + ".mp4");
             bool hevc = enc != null && enc.StartsWith("hevc");
             string saida;
-            int cod = Ffmpeg.Rodar("-hide_banner -loglevel error -nostdin -y -i " + Ffmpeg.Aspas(arq) + " -map 0 -c copy " +
-                                   (hevc ? "-tag:v hvc1 " : "") + "-movflags +faststart " + Ffmpeg.Aspas(destino), null, 600000, out saida);
-            if (cod == 0 && File.Exists(destino) && new FileInfo(destino).Length > 0) File.Delete(arq);
-            else
+            int cod = Ffmpeg.Rodar("-hide_banner -loglevel error -nostdin -y -i \"concat:" + string.Join("|", partes.ToArray()) +
+                                   "\" -map 0 -c copy " + (hevc ? "-tag:v hvc1 " : "") + "-movflags +faststart " + Ffmpeg.Aspas(destino),
+                                   pasta, 600000, out saida);
+            if (!(cod == 0 && File.Exists(destino) && new FileInfo(destino).Length > 0))
             {
                 App.Log("Erro ao converter a gravacao (" + cod + "): " + saida);
                 try { if (File.Exists(destino)) File.Delete(destino); } catch { }
-                destino = Replay.CaminhoNovo("gravacao-", ".mkv");
-                File.Move(arq, destino);
+                destino = Path.ChangeExtension(destino, ".ts");
+                using (FileStream fo = File.Create(destino))
+                    foreach (string pt in partes)
+                        using (FileStream fi = File.OpenRead(Path.Combine(pasta, pt))) fi.CopyTo(fo);
             }
+            Directory.Delete(pasta, true);
             string dur;
             try { Bitmap b = Miniaturas.Ler(destino, true, out dur); if (b != null) b.Dispose(); } catch { dur = null; }
             info = (dur != null ? dur + Tema.Ponto : "") + Replay.Tamanho(new FileInfo(destino).Length) + Tema.Ponto + Path.GetFileName(destino);
@@ -7174,12 +7488,14 @@ static class Gravacao
         }
     }
 
-    // O app fechou ou caiu no meio de uma gravacao: o .mkv vai para a pasta dos clipes
+    // O app fechou ou caiu no meio de uma gravacao: as partes viram video na
+    // pasta dos clipes (em fundo: uma gravacao longa leva alguns segundos)
     public static void Recuperar()
     {
         try
         {
             if (!Directory.Exists(PastaTemp)) return;
+            // Gravacoes da versao 1.7 (um .mkv so)
             foreach (string f in Directory.GetFiles(PastaTemp, "*.mkv"))
             {
                 if (new FileInfo(f).Length == 0) { File.Delete(f); continue; }
@@ -7188,11 +7504,24 @@ static class Gravacao
                 for (int n = 2; File.Exists(d); n++) d = Path.Combine(ConfigClipe.Pasta, Path.GetFileNameWithoutExtension(f) + "_" + n + ".mkv");
                 File.Move(f, d);
             }
+            string[] pastas = Directory.GetDirectories(PastaTemp, "gravacao-*");
+            if (pastas.Length == 0) return;
+            Thread t = new Thread(delegate()
+            {
+                foreach (string p in pastas)
+                {
+                    if (p == sessao) continue;   // gravando agora
+                    string destino, info;
+                    if (Finalizar(p, null, out destino, out info, true)) App.Log("Gravacao recuperada: " + info);
+                }
+                Replay.NaJanela(delegate { if (Galeria.Atual != null) Galeria.Atual.Recarregar(); });
+            });
+            t.Start();
         }
         catch (Exception ex) { App.Log("Erro ao recuperar gravacao: " + ex.Message); }
     }
 
-    // Saindo do programa: fecha o arquivo e deixa para o Recuperar da proxima vez
+    // Saindo do programa: fecha a parte atual e deixa para o Recuperar da proxima vez
     public static void ParaSair()
     {
         FecharIndicador();
@@ -7201,7 +7530,7 @@ static class Gravacao
         geracao++;
         Terminar(proc, pc, mic);
         proc = null; pc = null; mic = null;
-        Recuperar();
+        sessao = null;
     }
 
     static void FecharIndicador()
