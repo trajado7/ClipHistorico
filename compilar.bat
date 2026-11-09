@@ -25,7 +25,7 @@ taskkill /IM ClipHistorico.exe /F >nul 2>&1
 timeout /t 1 /nobreak >nul
 
 rem x86 = versao 32 bits, que usa menos memoria
-"%CSC%" /nologo /target:winexe /platform:x86 /optimize+ /debug- %ICONE% /resource:emojis.gz,emojis.gz /out:ClipHistorico.exe /r:System.Windows.Forms.dll /r:System.Drawing.dll ClipHistorico.cs
+"%CSC%" /nologo /target:winexe /platform:x86 /optimize+ /debug- %ICONE% /resource:emojis.gz,emojis.gz /out:ClipHistorico.exe /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.IO.Compression.dll /r:Microsoft.VisualBasic.dll ClipHistorico.cs
 
 if errorlevel 1 (
     echo.

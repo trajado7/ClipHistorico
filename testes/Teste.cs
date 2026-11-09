@@ -577,11 +577,296 @@ static class Teste
         return typeof(Janela).GetField(nome, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic).GetValue(j);
     }
 
+    // ---- Clipes e galeria ----
+    static bool Esperar(Func<bool> condicao, int ms)
+    {
+        Stopwatch sw = Stopwatch.StartNew();
+        while (!condicao() && sw.ElapsedMilliseconds < ms) { Application.DoEvents(); System.Threading.Thread.Sleep(20); }
+        return condicao();
+    }
+
+    static void Pedaco(string pasta, string nome, DateTime quando)
+    {
+        string f = Path.Combine(pasta, nome);
+        File.WriteAllText(f, nome);
+        File.SetLastWriteTimeUtc(f, quando);
+    }
+
+    static string Sondar(string arquivo)
+    {
+        string s;
+        Ffmpeg.Rodar("-hide_banner -i " + Ffmpeg.Aspas(arquivo), null, 15000, out s);
+        return s;
+    }
+
+    static void TestarClipes(string saida)
+    {
+        // qualidade e linha de comando
+        ConfigClipe.UsarQualidade(1);
+        Ok(ConfigClipe.Altura == 1080 && ConfigClipe.Fps == 60 && ConfigClipe.Mbps == 20 && ConfigClipe.Qualidade() == 1, "qualidade media");
+        ConfigClipe.Mbps = 21;
+        Ok(ConfigClipe.Qualidade() == 3, "mexeu nos bits: personalizada");
+        ConfigClipe.UsarQualidade(2);
+
+        Replay.Opcoes o = new Replay.Opcoes();
+        o.Fps = 60; o.Mbps = 50; o.Segundos = 30; o.Monitor = 1; o.Codificador = "h264_nvenc"; o.MostrarCursor = true;
+        string a = Replay.MontarArgs(o, null, null);
+        Console.WriteLine(a);
+        Ok(a.Contains("ddagrab=output_idx=1:framerate=60:draw_mouse=1") && !a.Contains("-vf") && !a.Contains("-c:a"), "nativa: tudo na placa, sem filtro e sem som");
+        Ok(a.Contains("-segment_wrap 38") && a.Contains("-segment_list_size 38") && a.Contains("-b:v 50000k -maxrate 75000k"), "anel e taxa de bits");
+        o.Altura = 720;
+        a = Replay.MontarArgs(o, "-f f32le -i A", "-f f32le -i B");
+        Ok(a.Contains("hwdownload") && a.Contains("min(720,ih)") && a.Contains("amix=inputs=2") && a.Contains("-map \"[som]\"") && a.Contains("-c:a aac"), "720p com som do PC e microfone");
+        a = Replay.MontarArgs(o, "-f f32le -i A", null);
+        Ok(a.Contains("-map 1:a") && !a.Contains("amix"), "so o som do PC");
+        o.Altura = 0; o.Codificador = "libx264";
+        Ok(Replay.Filtro(o).EndsWith("format=yuv420p"), "x264 traz a imagem para o processador");
+
+        // escolha dos pedacos do anel
+        string anel = Path.Combine(saida, "anel");
+        if (Directory.Exists(anel)) Directory.Delete(anel, true);
+        Directory.CreateDirectory(anel);
+        DateTime t0 = DateTime.UtcNow.AddSeconds(-20);
+        Pedaco(anel, "seg0000.ts", t0.AddSeconds(-30));   // sobra da volta anterior do anel
+        for (int i = 5; i <= 9; i++) Pedaco(anel, "seg" + i.ToString("0000") + ".ts", t0.AddSeconds(i));
+        File.WriteAllText(Path.Combine(anel, "lista.csv"), "seg0005.ts,5.0,6.0\nseg0006.ts,6.0,7.0\nseg0007.ts,7.0,8.0\nseg0008.ts,8.0,9.0\n");
+        List<string> p = Replay.EscolherPedacos(anel, 3, 10);
+        Ok(string.Join("|", p.ToArray()) == "seg0006.ts|seg0007.ts|seg0008.ts|seg0009.ts", "ultimos 3 prontos + o que esta gravando: " + string.Join("|", p.ToArray()));
+        File.AppendAllText(Path.Combine(anel, "lista.csv"), "seg0009.ts,9.0,10.0\n");
+        p = Replay.EscolherPedacos(anel, 3, 10);
+        Ok(string.Join("|", p.ToArray()) == "seg0007.ts|seg0008.ts|seg0009.ts", "nao emenda a sobra velha do anel: " + string.Join("|", p.ToArray()));
+        File.Delete(Path.Combine(anel, "lista.csv"));
+        Ok(Replay.EscolherPedacos(anel, 3, 10).Count == 0, "sem lista, sem pedacos");
+
+        Ok(Miniaturas.LerDuracao("  Duration: 00:01:05.60, start: 0") == "1:06", "duracao 1:06");
+        Ok(Miniaturas.LerDuracao("Duration: 01:02:03.00,") == "1:02:03", "duracao com hora");
+        Ok(GradeMidias.NomeDia(DateTime.Now) == "Hoje" && GradeMidias.NomeDia(DateTime.Now.AddDays(-1)) == "Ontem", "hoje e ontem");
+        Console.WriteLine("dia antigo: " + GradeMidias.NomeDia(new DateTime(2026, 11, 3)));
+        Ok(Replay.Tamanho(5 * 1024 * 1024) == "5,0 MB" || Replay.Tamanho(5 * 1024 * 1024) == "5.0 MB", "tamanho em MB: " + Replay.Tamanho(5 * 1024 * 1024));
+
+        string clipes = Path.Combine(saida, "clipes");
+        if (Directory.Exists(clipes)) Directory.Delete(clipes, true);
+        Directory.CreateDirectory(clipes);
+        TestarGravacao(clipes);
+        TestarGaleria(saida, clipes);
+    }
+
+    // Grava a tela de verdade, salva um clipe e confere o arquivo
+    static void TestarGravacao(string clipes)
+    {
+        if (Ffmpeg.Caminho == null) { Ok(false, "ffmpeg encontrado"); return; }
+        Console.WriteLine("ffmpeg: " + Ffmpeg.Caminho);
+        ConfigClipe.Pasta = clipes;
+        ConfigClipe.Segundos = 15;
+        ConfigClipe.UsarQualidade(2);
+        ConfigClipe.Codec = "h264";
+        ConfigClipe.SomPc = true;
+        ConfigClipe.Microfone = false;
+        ConfigClipe.Ligado = true;
+
+        WindowsFormsSynchronizationContext ctx = new WindowsFormsSynchronizationContext();
+        System.Threading.SynchronizationContext.SetSynchronizationContext(ctx);
+        Stopwatch sw = Stopwatch.StartNew();
+        Replay.Preparar(ctx);
+        Esperar(delegate { return Replay.Gravando || (!Replay.Iniciando && Replay.Problema != null); }, 30000);
+        Console.WriteLine("iniciou em " + sw.ElapsedMilliseconds + " ms: " + Replay.StatusLongo);
+        Ok(Replay.Gravando, "replay gravando");
+        if (!Replay.Gravando) return;
+
+        // uso do processador pelo ffmpeg enquanto grava
+        Process[] ps = Process.GetProcessesByName("ffmpeg");
+        TimeSpan antes = TimeSpan.Zero;
+        foreach (Process x in ps) try { antes += x.TotalProcessorTime; } catch { }
+        Esperar(delegate { return false; }, 7000);
+        TimeSpan depois = TimeSpan.Zero;
+        foreach (Process x in ps) try { x.Refresh(); depois += x.TotalProcessorTime; } catch { }
+        Console.WriteLine("ffmpeg usou " + ((depois - antes).TotalMilliseconds / 7000.0 * 100 / Environment.ProcessorCount).ToString("0.0") +
+                          "% do processador (" + ((depois - antes).TotalMilliseconds / 70.0).ToString("0") + "% de um nucleo)");
+
+        sw.Restart();
+        Replay.SalvarClipe();
+        Esperar(delegate { return !Replay.Salvando; }, 30000);
+        Console.WriteLine("salvou em " + sw.ElapsedMilliseconds + " ms");
+        string[] feitos = Directory.GetFiles(clipes, "*.mp4");
+        Ok(feitos.Length == 1, "um clipe salvo");
+        if (feitos.Length == 1)
+        {
+            string s = Sondar(feitos[0]);
+            Console.WriteLine(s);
+            string d = Miniaturas.LerDuracao(s);
+            Ok(s.Contains("Video: h264") && s.Contains("Audio: aac"), "clipe tem video h264 e som aac");
+            Ok(d == "0:07" || d == "0:08" || d == "0:09", "clipe curto tem o tempo gravado ate agora: " + d);
+        }
+
+        // passou da duracao: o clipe fica com 15 s (+ o pedaco em andamento)
+        Esperar(delegate { return false; }, 12000);
+        Replay.SalvarClipe();
+        Esperar(delegate { return !Replay.Salvando; }, 30000);
+        feitos = Directory.GetFiles(clipes, "*.mp4");
+        Ok(feitos.Length == 2, "segundo clipe salvo");
+        if (feitos.Length == 2)
+        {
+            Array.Sort(feitos);
+            string d = Miniaturas.LerDuracao(Sondar(feitos[1]));
+            Ok(d == "0:15" || d == "0:16", "clipe longo limitado a 15 s: " + d);
+        }
+        string[] anel = Directory.GetFiles(ConfigClipe.PastaAnel, "seg*.ts");
+        Ok(anel.Length <= 15 + Replay.Folga, "anel nao passa do limite: " + anel.Length + " pedacos");
+
+        Process p = null;
+        foreach (Process x in Process.GetProcessesByName("ffmpeg")) p = x;
+        Replay.Parar();
+        Ok(p == null || p.WaitForExit(3000), "parar fecha o ffmpeg");
+        Ok(!Replay.Gravando, "parado");
+    }
+
+    // Pisca um quadrado branco no canto da tela principal e toca um bipe de
+    // 4 kHz ao mesmo tempo, 3 vezes. O clipe mostra se o som esta no compasso.
+    static byte[] Bipe()
+    {
+        int taxa = 48000, n = taxa * 150 / 1000;
+        MemoryStream ms = new MemoryStream();
+        BinaryWriter w = new BinaryWriter(ms);
+        w.Write(0x46464952); w.Write(36 + n * 2); w.Write(0x45564157); w.Write(0x20746D66); w.Write(16);
+        w.Write((short)1); w.Write((short)1); w.Write(taxa); w.Write(taxa * 2); w.Write((short)2); w.Write((short)16);
+        w.Write(0x61746164); w.Write(n * 2);
+        for (int i = 0; i < n; i++) w.Write((short)(Math.Sin(2 * Math.PI * 4000 * i / taxa) * 9000));
+        return ms.ToArray();
+    }
+
+    static void TestarSincronia(string saida)
+    {
+        string clipes = Path.Combine(saida, "sinc");
+        if (Directory.Exists(clipes)) Directory.Delete(clipes, true);
+        Directory.CreateDirectory(clipes);
+        ConfigClipe.Pasta = clipes;
+        ConfigClipe.Segundos = 15;
+        ConfigClipe.UsarQualidade(2);
+        ConfigClipe.Monitor = "";
+        ConfigClipe.SomPc = true;
+        ConfigClipe.Microfone = false;
+        ConfigClipe.Ligado = true;
+        WindowsFormsSynchronizationContext ctx = new WindowsFormsSynchronizationContext();
+        System.Threading.SynchronizationContext.SetSynchronizationContext(ctx);
+        Replay.Preparar(ctx);
+        Ok(Esperar(delegate { return Replay.Gravando; }, 30000), "gravando");
+
+        Form f = new Form();
+        f.FormBorderStyle = FormBorderStyle.None;
+        f.StartPosition = FormStartPosition.Manual;
+        f.ShowInTaskbar = false;
+        f.TopMost = true;
+        f.BackColor = Color.Black;
+        Rectangle t = Screen.PrimaryScreen.Bounds;
+        f.Bounds = new Rectangle(t.X, t.Y, 240, 240);
+        f.Show();
+        Esperar(delegate { return false; }, 2500);
+        using (MemoryStream ms = new MemoryStream(Bipe()))
+        using (System.Media.SoundPlayer sp = new System.Media.SoundPlayer(ms))
+        {
+            sp.Load();
+            for (int i = 0; i < 3; i++)
+            {
+                f.BackColor = Color.White;
+                f.Refresh();
+                sp.Play();
+                Esperar(delegate { return false; }, 500);
+                f.BackColor = Color.Black;
+                f.Refresh();
+                Esperar(delegate { return false; }, 1500);
+            }
+        }
+        f.Close();
+        Replay.SalvarClipe();
+        Esperar(delegate { return !Replay.Salvando; }, 30000);
+        foreach (string c in Directory.GetFiles(clipes, "*.mp4")) Console.WriteLine("CLIPE=" + c);
+        Replay.Parar();
+    }
+
+    static void TestarGaleria(string saida, string clipes)
+    {
+        string prints = Path.Combine(saida, "prints");
+        if (Directory.Exists(prints)) Directory.Delete(prints, true);
+        Directory.CreateDirectory(prints);
+        Color[] cores = { Color.SteelBlue, Color.IndianRed, Color.SeaGreen, Color.Goldenrod, Color.MediumPurple };
+        for (int i = 0; i < cores.Length; i++)
+        {
+            string f = Path.Combine(prints, "captura-" + i + ".png");
+            using (Bitmap b = new Bitmap(i == 2 ? 1080 : 1920, i == 2 ? 1920 : 1080))
+            {
+                using (Graphics g = Graphics.FromImage(b))
+                {
+                    g.Clear(cores[i]);
+                    g.FillEllipse(Brushes.White, b.Width / 4, b.Height / 4, b.Width / 2, b.Height / 2);
+                }
+                b.Save(f, ImageFormat.Png);
+            }
+            File.SetLastWriteTime(f, DateTime.Now.AddDays(i < 2 ? 0 : i < 4 ? -1 : -6).AddMinutes(-i));
+        }
+
+        Stopwatch sw = Stopwatch.StartNew();
+        Galeria gal = new Galeria(prints, clipes);
+        gal.FicarAberta = true;
+        gal.Show();
+        Console.WriteLine("abrir galeria: " + sw.ElapsedMilliseconds + " ms");
+        int esperadas = cores.Length + Directory.GetFiles(clipes, "*.mp4").Length;
+        Esperar(delegate { return false; }, 3000);   // miniaturas carregando em fundo
+        FotoForm(gal, Path.Combine(saida, "galeria.png"));
+        gal.MostrarConfig(true);
+        Esperar(delegate { return false; }, 1500);
+        FotoForm(gal, Path.Combine(saida, "galeria-config.png"));
+        Ok(!gal.IsDisposed, "galeria aberta ate o fim (" + esperadas + " itens)");
+        gal.Close();
+        Ok(Galeria.Atual == null, "galeria fechou");
+    }
+
     public static void Rodar(string[] args)
     {
         string saida = args[0];
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
+        if (args.Length > 1 && args[1] == "720mic")
+        {
+            string c = Path.Combine(saida, "c720");
+            if (Directory.Exists(c)) Directory.Delete(c, true);
+            Directory.CreateDirectory(c);
+            ConfigClipe.Pasta = c; ConfigClipe.Segundos = 15; ConfigClipe.UsarQualidade(0);
+            ConfigClipe.SomPc = true; ConfigClipe.Microfone = true; ConfigClipe.Ligado = true;
+            WindowsFormsSynchronizationContext ctx = new WindowsFormsSynchronizationContext();
+            System.Threading.SynchronizationContext.SetSynchronizationContext(ctx);
+            Replay.Preparar(ctx);
+            Ok(Esperar(delegate { return Replay.Gravando; }, 30000), "720p com microfone gravando: " + Replay.StatusLongo);
+            Process[] ps = Process.GetProcessesByName("ffmpeg");
+            TimeSpan antes = TimeSpan.Zero, depois = TimeSpan.Zero;
+            foreach (Process x in ps) try { antes += x.TotalProcessorTime; } catch { }
+            Esperar(delegate { return false; }, 5000);
+            foreach (Process x in ps) try { x.Refresh(); depois += x.TotalProcessorTime; } catch { }
+            Console.WriteLine("720p: ffmpeg usou " + ((depois - antes).TotalMilliseconds / 50.0).ToString("0") + "% de um nucleo");
+            Replay.SalvarClipe();
+            Esperar(delegate { return !Replay.Salvando; }, 30000);
+            string[] fs = Directory.GetFiles(c, "*.mp4");
+            Ok(fs.Length == 1, "salvou");
+            if (fs.Length == 1)
+            {
+                string s = Sondar(fs[0]);
+                Ok(s.Contains("1280x720") && s.Contains("Audio: aac") && s.Contains("30 fps"), "1280x720 30 fps com som");
+                foreach (string l in s.Split('\n')) if (l.Contains("Stream") || l.Contains("Duration")) Console.WriteLine(l.Trim());
+            }
+            Replay.Parar();
+            Console.WriteLine(falhas == 0 ? "TUDO OK" : "FALHAS: " + falhas);
+            Environment.Exit(falhas == 0 ? 0 : 1);
+        }
+        if (args.Length > 1 && args[1] == "sincronia")
+        {
+            TestarSincronia(saida);
+            Environment.Exit(falhas == 0 ? 0 : 1);
+        }
+        if (args.Length > 1 && args[1] == "clipes")
+        {
+            TestarClipes(saida);
+            Console.WriteLine(falhas == 0 ? "TUDO OK" : "FALHAS: " + falhas);
+            Environment.Exit(falhas == 0 ? 0 : 1);
+        }
 
         // arquivos do historico
         Ok(Historico.EhDoHistorico(@"C:\x\20261105_002426867.png"), "png do historico");
@@ -746,6 +1031,7 @@ static class Teste
 
         TestarEditor(saida);
         TestarRolagemERecorte(saida);
+        TestarClipes(saida);
 
         Console.WriteLine(falhas == 0 ? "TUDO OK" : "FALHAS: " + falhas);
         Environment.Exit(falhas == 0 ? 0 : 1);
