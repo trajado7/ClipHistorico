@@ -17,7 +17,8 @@ Até a versão 1.6 se chamava **ClipHistorico**. Ao abrir a versão nova, as pas
 - **Gravação:** `Alt + F9` começa e para. Grava até você parar, com as mesmas configurações dos clipes, e salva em `Vídeos\CLIPES` como `gravacao-....mp4`. Um "● REC" com o tempo aparece no canto, mas não sai no vídeo. Se o programa fechar no meio, o que foi gravado vira vídeo na pasta na próxima vez que ele abrir.
 - **Jogos em tela cheia (BlueStacks e outros):** quando um jogo em tela cheia ganha ou perde o foco (`Alt + Tab`, tecla Windows, um aviso), o Windows tira a tela da captura por um instante (erro `887a0026`). O programa percebe na hora e volta a gravar em menos de 0,1 segundo, **sem perder o que já estava no replay**: o clipe passa pelo ponto da queda com um salto de menos de 1 segundo, e o segundo logo antes da queda também entra. A gravação (`Alt + F9`) continua no mesmo vídeo.
 - **Vigia da captura:** se a captura travar sem nenhum erro, o replay reinicia sozinho em cerca de 2 segundos, também sem perder o que já tinha. Um clipe nunca sai com imagem de minutos atrás.
-- **Galeria (`Alt + Z`):** prints, clipes e gravações numa tela só, separados por dia, com o replay, a gravação e as configurações no topo. Um clique abre (vídeo no player, print no editor).
+- **Editor de clipes:** um clique num clipe ou gravação da galeria abre o editor. Toca o vídeo (Espaço ou clique nele) e repete só o trecho escolhido. Arraste as alças da linha do tempo ou use `I` e `O` para marcar início e fim; `←` e `→` andam um quadro e, com `Shift`, 1 segundo. Dá para mudar o volume (0 a 200%) ou tirar o som. **Salvar como novo** (`Ctrl + S`) põe o corte ao lado do original; **Substituir original** troca o arquivo e manda o original para a Lixeira. O corte é instantâneo e sem perder qualidade, porque o vídeo é copiado sem recodificar: o início encaixa no quadro-chave mais perto (os clipes têm um por segundo). O vídeo toca pelo Windows Media Player que já vem no Windows; sem ele, o clipe abre no player.
+- **Galeria (`Alt + Z`):** prints, clipes e gravações numa tela só, separados por dia, com o replay, a gravação e as configurações no topo. Um clique abre (vídeo no editor de clipes, print no editor de imagem); o botão direito também tem **Assistir no player**.
   - **Selecionar vários:** arraste um retângulo com o mouse (a tela rola sozinha perto da borda), clique no círculo do canto, use `Ctrl + clique`, `Shift + clique` ou `Ctrl + A`.
   - **Com a seleção:** copiar (cola como arquivos no WhatsApp, Discord ou numa pasta), mostrar na pasta, mandar para a Lixeira (`Delete`) ou **excluir permanentemente** (`Shift + Delete`, pede confirmação).
   - **Configurações:** duração, qualidade, resolução, FPS, taxa de bits, formato (H.264, HEVC ou AV1, conforme a placa), monitor, som, cursor, pasta e os **atalhos** dos vídeos.
@@ -65,9 +66,12 @@ O histórico fica em arquivos comuns, sem criptografia. Tudo o que você copiar,
 `testes/Teste.cs` testa o programa sem tocar no seu histórico. Só entra na compilação com `/define:TESTE`:
 
 ```
-csc /target:exe /platform:x86 /define:TESTE /resource:emojis.gz,emojis.gz /out:teste.exe /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.IO.Compression.dll /r:Microsoft.VisualBasic.dll TrajadoTools.cs testes\Teste.cs
+set WPF=%WINDIR%\Microsoft.NET\Framework\v4.0.30319\WPF
+csc /target:exe /platform:x86 /define:TESTE /resource:emojis.gz,emojis.gz /out:teste.exe /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.IO.Compression.dll /r:Microsoft.VisualBasic.dll /lib:"%WPF%" /r:PresentationCore.dll /r:PresentationFramework.dll /r:WindowsBase.dll /r:WindowsFormsIntegration.dll /r:System.Xaml.dll TrajadoTools.cs testes\Teste.cs
 teste.exe <pasta para os arquivos de teste>
 ```
+
+`teste.exe <pasta> editor` testa o editor de clipes: monta um clipe como o replay faz, confere os quadros-chave lidos do .mp4 contra os do ffmpeg, corta, muda o volume, abre a janela fora da tela (sem tirar o foco de ninguém) e salva fotos dela. `teste.exe <pasta> icone` gera o `icone.ico`.
 
 Deixe o mouse no monitor principal: o editor e a galeria abrem na tela do mouse, e os testes do editor contam com uma tela larga.
 

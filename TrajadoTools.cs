@@ -36,6 +36,8 @@ using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
 using Timer = System.Windows.Forms.Timer;
+using SaveFileDialog = System.Windows.Forms.SaveFileDialog;   // o WPF (editor de clipe) tem outro com o mesmo nome
+using OpenFileDialog = System.Windows.Forms.OpenFileDialog;
 
 
 // ---------------------------------------------------------------------
@@ -5314,6 +5316,11 @@ class App : ApplicationContext
     }
 
     // ---- Galeria (Alt + Z) ----
+    public static void AbrirGaleria()
+    {
+        if (instancia != null && Galeria.Atual == null) instancia.AlternarGaleria();
+    }
+
     void AlternarGaleria()
     {
         if (Galeria.Atual != null) { Galeria.Atual.Close(); return; }
@@ -7650,6 +7657,952 @@ static class Gravacao
     }
 }
 
+// ---------------------------------------------------------------------
+// EDITOR DE CLIPE: cortar e ajustar o som de um video da galeria
+// ---------------------------------------------------------------------
+// Salvar copia o video sem recodificar: e instantaneo e nao perde
+// qualidade. Para isso o inicio do corte encaixa num quadro-chave (os
+// clipes e gravacoes tem um a cada 1 s); os quadros-chave vem do indice do
+// proprio .mp4, sem precisar de ffprobe. So o som e recodificado, e so se
+// o volume mudar. Arquivo que nao e .mp4 (gravacao recuperada) e recodificado.
+static class CorteClipe
+{
+    public class Info
+    {
+        public double Duracao;                               // segundos
+        public List<double> Chaves = new List<double>();     // inicio de cada quadro-chave, em ordem
+        public double Quadro = 1 / 60.0;                     // duracao de um quadro
+    }
+
+    // null = nao e um .mp4 que da para ler
+    public static Info Ler(string arquivo)
+    {
+        try
+        {
+            using (FileStream f = File.OpenRead(arquivo))
+            using (BinaryReader r = new BinaryReader(f))
+            {
+                long moov = Achar(r, 0, f.Length, "moov");
+                if (moov < 0) return null;
+                long fimMoov = moov + Tamanho(r, moov);
+                double duracaoTotal = 0;
+                uint escalaFilme = 0;
+                long mvhd = Achar(r, moov + 8, fimMoov, "mvhd");
+                if (mvhd >= 0)
+                {
+                    f.Position = mvhd + 8;
+                    int versao = r.ReadByte(); f.Position += 3;
+                    f.Position += versao == 1 ? 16 : 8;
+                    escalaFilme = U32(r);
+                    double dur = versao == 1 ? U64(r) : U32(r);
+                    if (escalaFilme > 0) duracaoTotal = dur / escalaFilme;
+                }
+                Info video = null;
+                for (long p = moov + 8; p < fimMoov; )
+                {
+                    long t = Tamanho(r, p);
+                    if (t < 8) break;
+                    if (Tipo(r, p) == "trak")
+                    {
+                        Info i = LerTrilha(r, p, p + t, escalaFilme);
+                        if (i != null && video == null) video = i;
+                    }
+                    p += t;
+                }
+                if (video == null) return null;
+                if (duracaoTotal > 0) video.Duracao = Math.Max(video.Duracao, duracaoTotal);
+                if (video.Chaves.Count == 0) video.Chaves.Add(0);
+                return video;
+            }
+        }
+        catch { return null; }
+    }
+
+    static Info LerTrilha(BinaryReader r, long ini, long fim, uint escalaFilme)
+    {
+        long mdia = Achar(r, ini + 8, fim, "mdia");
+        if (mdia < 0) return null;
+        long fimMdia = mdia + Tamanho(r, mdia);
+        long hdlr = Achar(r, mdia + 8, fimMdia, "hdlr");
+        if (hdlr < 0) return null;
+        r.BaseStream.Position = hdlr + 16;
+        if (Encoding.ASCII.GetString(r.ReadBytes(4)) != "vide") return null;
+
+        long mdhd = Achar(r, mdia + 8, fimMdia, "mdhd");
+        r.BaseStream.Position = mdhd + 8;
+        int v = r.ReadByte(); r.BaseStream.Position += 3;
+        r.BaseStream.Position += v == 1 ? 16 : 8;
+        uint escala = U32(r);
+        double duracao = v == 1 ? U64(r) : U32(r);
+        if (escala == 0) return null;
+
+        // Lista de edicao: o trecho vazio no comeco atrasa o video (nos clipes,
+        // ~0,021 s, porque o som comeca antes) e o tempo de midia adianta (o
+        // ffmpeg o usa por causa dos quadros B). Sem isso o corte cai 1 s antes.
+        long tempoMidia = 0;
+        double atraso = 0;
+        long edts = Achar(r, ini + 8, fim, "edts");
+        if (edts >= 0)
+        {
+            long elst = Achar(r, edts + 8, edts + Tamanho(r, edts), "elst");
+            if (elst >= 0)
+            {
+                r.BaseStream.Position = elst + 8;
+                int ve = r.ReadByte(); r.BaseStream.Position += 3;
+                uint n = U32(r);
+                for (uint k = 0; k < n; k++)
+                {
+                    long dur = ve == 1 ? (long)U64(r) : U32(r);
+                    long mt = ve == 1 ? (long)U64(r) : (int)U32(r);
+                    r.BaseStream.Position += 4;
+                    if (mt >= 0) { tempoMidia = mt; break; }
+                    if (escalaFilme > 0) atraso += dur / (double)escalaFilme;   // -1 = trecho vazio
+                }
+            }
+        }
+
+        long minf = Achar(r, mdia + 8, fimMdia, "minf");
+        long stbl = minf < 0 ? -1 : Achar(r, minf + 8, minf + Tamanho(r, minf), "stbl");
+        if (stbl < 0) return null;
+        long fimStbl = stbl + Tamanho(r, stbl);
+
+        // stts: duracao de cada amostra -> tempo de decodificacao (dts)
+        List<long> dts = new List<long>();
+        long stts = Achar(r, stbl + 8, fimStbl, "stts");
+        if (stts < 0) return null;
+        r.BaseStream.Position = stts + 12;
+        uint entradas = U32(r);
+        long relogio = 0, delta = 0;
+        for (uint k = 0; k < entradas; k++)
+        {
+            uint qtd = U32(r); delta = U32(r);
+            for (uint q = 0; q < qtd; q++) { dts.Add(relogio); relogio += delta; }
+        }
+
+        // ctts: quanto cada amostra aparece depois de ser decodificada
+        long[] desloc = null;
+        long ctts = Achar(r, stbl + 8, fimStbl, "ctts");
+        if (ctts >= 0)
+        {
+            r.BaseStream.Position = ctts + 8;
+            int vc = r.ReadByte(); r.BaseStream.Position += 3;
+            uint n = U32(r);
+            desloc = new long[dts.Count];
+            int idx = 0;
+            for (uint k = 0; k < n && idx < desloc.Length; k++)
+            {
+                uint qtd = U32(r);
+                uint bruto = U32(r);
+                long d = vc == 1 ? (long)(int)bruto : (long)bruto;   // versao 1 tem sinal
+                for (uint q = 0; q < qtd && idx < desloc.Length; q++) desloc[idx++] = d;
+            }
+        }
+
+        Info info = new Info();
+        info.Duracao = duracao / escala;
+        if (delta > 0) info.Quadro = delta / (double)escala;
+        long stss = Achar(r, stbl + 8, fimStbl, "stss");
+        if (stss < 0)
+        {
+            info.Chaves.Add(0);   // sem tabela = todo quadro e chave: corta em qualquer ponto
+            info.Quadro = 0;
+            return info;
+        }
+        r.BaseStream.Position = stss + 12;
+        uint nChaves = U32(r);
+        for (uint k = 0; k < nChaves; k++)
+        {
+            int amostra = (int)U32(r) - 1;
+            if (amostra < 0 || amostra >= dts.Count) continue;
+            long pts = dts[amostra] + (desloc != null ? desloc[amostra] : 0) - tempoMidia;
+            info.Chaves.Add(Math.Max(0, atraso + pts / (double)escala));
+        }
+        info.Chaves.Sort();
+        return info;
+    }
+
+    static long Achar(BinaryReader r, long ini, long fim, string tipo)
+    {
+        for (long p = ini; p + 8 <= fim; )
+        {
+            long t = Tamanho(r, p);
+            if (t < 8) return -1;
+            if (Tipo(r, p) == tipo) return p;
+            p += t;
+        }
+        return -1;
+    }
+
+    static long Tamanho(BinaryReader r, long p)
+    {
+        r.BaseStream.Position = p;
+        long t = U32(r);
+        if (t == 1) { r.BaseStream.Position = p + 8; t = (long)U64(r); }
+        else if (t == 0) t = r.BaseStream.Length - p;
+        return t;
+    }
+
+    static string Tipo(BinaryReader r, long p)
+    {
+        r.BaseStream.Position = p + 4;
+        return Encoding.ASCII.GetString(r.ReadBytes(4));
+    }
+
+    static uint U32(BinaryReader r) { byte[] b = r.ReadBytes(4); return (uint)(b[0] << 24 | b[1] << 16 | b[2] << 8 | b[3]); }
+    static ulong U64(BinaryReader r) { return ((ulong)U32(r) << 32) | U32(r); }
+
+    // Quadro-chave mais perto de t (o inicio do corte so pode cair num deles)
+    public static double ChaveMaisPerto(Info i, double t)
+    {
+        if (i == null || i.Quadro == 0 || i.Chaves.Count == 0) return t;
+        double melhor = i.Chaves[0];
+        foreach (double c in i.Chaves) if (Math.Abs(c - t) < Math.Abs(melhor - t)) melhor = c;
+        return melhor;
+    }
+
+    static string Num(double v) { return v.ToString("0.000", CultureInfo.InvariantCulture); }
+
+    // Linha de comando do ffmpeg para o corte. copiar = sem recodificar o video.
+    public static string Argumentos(string entrada, string saida, double inicio, double fim, int volume, bool mudo, bool copiar)
+    {
+        StringBuilder a = new StringBuilder("-hide_banner -loglevel error -nostdin -y ");
+        // Copiando, o ffmpeg comeca no quadro-chave anterior ao ponto pedido: 8 ms
+        // a mais garantem que o arredondamento nao caia no quadro-chave de 1 s antes
+        double ss = copiar ? inicio + 0.008 : inicio;
+        a.Append("-ss ").Append(Num(ss)).Append(" -to ").Append(Num(fim)).Append(" -i ").Append(Ffmpeg.Aspas(entrada)).Append(' ');
+        a.Append("-map 0:v:0 ");
+        if (!mudo) a.Append("-map 0:a? ");
+        a.Append(copiar ? "-c:v copy " : "-c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p ");
+        if (mudo) a.Append("-an ");
+        else if (volume == 100 && copiar) a.Append("-c:a copy ");
+        else
+        {
+            a.Append("-c:a aac -b:a 192k ");
+            if (volume != 100) a.Append("-af volume=").Append((volume / 100.0).ToString("0.00", CultureInfo.InvariantCulture)).Append(' ');
+        }
+        a.Append("-avoid_negative_ts make_zero -movflags +faststart ").Append(Ffmpeg.Aspas(saida));
+        return a.ToString();
+    }
+
+    public static string NomeNovo(string original)
+    {
+        string pasta = Path.GetDirectoryName(original), nome = Path.GetFileNameWithoutExtension(original);
+        string d = Path.Combine(pasta, nome + "-corte.mp4");
+        for (int n = 2; File.Exists(d); n++) d = Path.Combine(pasta, nome + "-corte" + n + ".mp4");
+        return d;
+    }
+
+    // Faz o corte. Roda fora da thread da janela. null = deu certo; senao, o erro.
+    public static string Exportar(string entrada, string saida, double inicio, double fim, int volume, bool mudo)
+    {
+        if (Ffmpeg.Caminho == null) return "falta o ffmpeg";
+        bool copiar = Path.GetExtension(entrada).Equals(".mp4", StringComparison.OrdinalIgnoreCase) && Ler(entrada) != null;
+        string saidaTxt;
+        int cod = Ffmpeg.Rodar(Argumentos(entrada, saida, inicio, fim, volume, mudo, copiar), null, copiar ? 120000 : 1800000, out saidaTxt);
+        bool ok = cod == 0 && File.Exists(saida) && new FileInfo(saida).Length > 0;
+        if (ok) return null;
+        App.Log("Erro ao cortar o clipe (" + cod + "): " + saidaTxt);
+        try { if (File.Exists(saida)) File.Delete(saida); } catch { }
+        return Ffmpeg.Resumo(saidaTxt) ?? "erro " + cod;
+    }
+
+    // Faixa de miniaturas para a linha do tempo, num ffmpeg so: cada entrada
+    // pula direto para um ponto (rapido mesmo numa gravacao de 1 hora)
+    public static Bitmap Miniaturas(string arquivo, double duracao, int quantas, int altura)
+    {
+        if (Ffmpeg.Caminho == null || duracao <= 0) return null;
+        string png = Path.Combine(Path.GetTempPath(), "TrajadoTools-faixa-" + Guid.NewGuid().ToString("N") + ".png");
+        try
+        {
+            StringBuilder a = new StringBuilder("-hide_banner -loglevel error -nostdin -y ");
+            StringBuilder fil = new StringBuilder();
+            for (int i = 0; i < quantas; i++)
+            {
+                double t = duracao * (i + 0.5) / quantas;
+                a.Append("-noaccurate_seek -ss ").Append(Num(t)).Append(" -i ").Append(Ffmpeg.Aspas(arquivo)).Append(' ');
+                fil.Append('[').Append(i).Append(":v:0]trim=end_frame=1,scale=-2:").Append(altura).Append(",setsar=1,setpts=PTS-STARTPTS[m").Append(i).Append("];");
+            }
+            for (int i = 0; i < quantas; i++) fil.Append("[m").Append(i).Append(']');
+            fil.Append("hstack=inputs=").Append(quantas).Append("[faixa]");
+            a.Append("-filter_complex \"").Append(fil).Append("\" -map \"[faixa]\" -frames:v 1 ").Append(Ffmpeg.Aspas(png));
+            string saida;
+            if (Ffmpeg.Rodar(a.ToString(), null, 60000, out saida) != 0 || !File.Exists(png))
+            {
+                App.Log("Erro nas miniaturas do clipe: " + Ffmpeg.Resumo(saida));
+                return null;
+            }
+            using (Bitmap b = new Bitmap(png)) return new Bitmap(b);
+        }
+        catch (Exception ex) { App.Log("Erro nas miniaturas do clipe: " + ex.Message); return null; }
+        finally { try { File.Delete(png); } catch { } }
+    }
+
+    public static string Tempo(double s)
+    {
+        if (s < 0) s = 0;
+        int m = (int)(s / 60);
+        double r = s - m * 60;
+        return m + ":" + r.ToString("00.0", CultureInfo.InvariantCulture).Replace('.', ',');
+    }
+}
+
+// Linha do tempo: miniaturas, o trecho escolhido entre duas alcas e o cursor
+class LinhaDoTempo : Control
+{
+    public CorteClipe.Info Info;
+    public Bitmap Faixa;
+    public double Duracao = 1, Inicio, Fim = 1, Posicao;
+    public event Action Mudou;            // inicio ou fim
+    public event Action<double> Buscou;   // clicou ou arrastou o cursor
+    public const double Minimo = 0.5;     // trecho mais curto
+
+    int arrastando;   // 0 nada, 1 inicio, 2 fim, 3 cursor
+    const int Margem = 14;
+
+    public LinhaDoTempo()
+    {
+        SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+        Height = 84;
+        BackColor = Tema.Fundo;
+        Cursor = Cursors.Hand;
+    }
+
+    Rectangle Trilho { get { return new Rectangle(Margem, 14, Width - Margem * 2, Height - 22); } }
+    int X(double t) { Rectangle r = Trilho; return r.X + (int)Math.Round(r.Width * Math.Max(0, Math.Min(1, t / Duracao))); }
+    double T(int x) { Rectangle r = Trilho; return Math.Max(0, Math.Min(Duracao, (x - r.X) * Duracao / Math.Max(1, r.Width))); }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        Graphics g = e.Graphics;
+        g.Clear(BackColor);
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        Rectangle r = Trilho;
+        g.FillRectangle(Tema.Pincel(Tema.Campo), r);
+        if (Faixa != null)
+        {
+            g.InterpolationMode = InterpolationMode.HighQualityBilinear;
+            g.DrawImage(Faixa, r);
+        }
+        // Fora do trecho fica escuro
+        int xi = X(Inicio), xf = X(Fim);
+        using (SolidBrush escuro = new SolidBrush(Color.FromArgb(175, 10, 10, 14)))
+        {
+            if (xi > r.X) g.FillRectangle(escuro, r.X, r.Y, xi - r.X, r.Height);
+            if (xf < r.Right) g.FillRectangle(escuro, xf, r.Y, r.Right - xf, r.Height);
+        }
+        using (Pen borda = new Pen(Tema.Destaque, 3))
+        {
+            g.DrawLine(borda, xi, r.Y + 1, xf, r.Y + 1);
+            g.DrawLine(borda, xi, r.Bottom - 2, xf, r.Bottom - 2);
+        }
+        Alca(g, xi, r, true);
+        Alca(g, xf, r, false);
+
+        // Cursor
+        int xp = X(Posicao);
+        g.FillRectangle(Brushes.White, xp - 1, r.Y - 6, 2, r.Height + 10);
+        g.FillPolygon(Brushes.White, new[] { new Point(xp - 6, r.Y - 12), new Point(xp + 6, r.Y - 12), new Point(xp, r.Y - 5) });
+    }
+
+    static void Alca(Graphics g, int x, Rectangle r, bool esquerda)
+    {
+        Rectangle a = new Rectangle(esquerda ? x - 12 : x, r.Y, 12, r.Height);
+        using (GraphicsPath p = Tema.Arredondado(a, 4)) g.FillPath(Tema.Pincel(Tema.Destaque), p);
+        int cx = a.X + 6, cy = r.Y + r.Height / 2;
+        using (Pen p = new Pen(Color.FromArgb(220, 255, 255, 255), 1.5f))
+        {
+            g.DrawLine(p, cx - 2, cy - 7, cx - 2, cy + 7);
+            g.DrawLine(p, cx + 2, cy - 7, cx + 2, cy + 7);
+        }
+    }
+
+    protected override void OnMouseDown(MouseEventArgs e)
+    {
+        base.OnMouseDown(e);
+        if (e.Button != MouseButtons.Left) return;
+        int xi = X(Inicio), xf = X(Fim);
+        if (e.X >= xi - 16 && e.X <= xi + 4) arrastando = 1;
+        else if (e.X >= xf - 4 && e.X <= xf + 16) arrastando = 2;
+        else { arrastando = 3; Buscar(e.X); }
+    }
+
+    protected override void OnMouseMove(MouseEventArgs e)
+    {
+        base.OnMouseMove(e);
+        if (arrastando == 0)
+        {
+            int xi = X(Inicio), xf = X(Fim);
+            Cursor = (e.X >= xi - 16 && e.X <= xi + 4) || (e.X >= xf - 4 && e.X <= xf + 16) ? Cursors.SizeWE : Cursors.Hand;
+            return;
+        }
+        double t = T(e.X);
+        if (arrastando == 1) DefinirInicio(t);
+        else if (arrastando == 2) DefinirFim(t);
+        else Buscar(e.X);
+    }
+
+    protected override void OnMouseUp(MouseEventArgs e) { base.OnMouseUp(e); arrastando = 0; }
+
+    void Buscar(int x)
+    {
+        Posicao = T(x);
+        Invalidate();
+        if (Buscou != null) Buscou(Posicao);
+    }
+
+    // O inicio encaixa no quadro-chave mais perto (o corte e sem recodificar)
+    public void DefinirInicio(double t)
+    {
+        double c = CorteClipe.ChaveMaisPerto(Info, Math.Max(0, Math.Min(t, Fim - Minimo)));
+        if (c > Fim - Minimo) c = Math.Max(0, Fim - Minimo);
+        if (c == Inicio) return;
+        Inicio = c;
+        Invalidate();
+        if (Mudou != null) Mudou();
+    }
+
+    public void DefinirFim(double t)
+    {
+        double f = Math.Max(Inicio + Minimo, Math.Min(Duracao, t));
+        if (f == Fim) return;
+        Fim = f;
+        Invalidate();
+        if (Mudou != null) Mudou();
+    }
+}
+
+// A janela do editor. O video toca num MediaElement do WPF, que usa o
+// Windows Media Player que ja vem no Windows. Tudo de WPF fica nesta classe:
+// o WPF so e carregado quando o editor abre (o programa segue leve).
+class EditorClipe : Form
+{
+    public static EditorClipe Atual;
+    public string Arquivo { get { return arquivo; } }
+    public LinhaDoTempo Linha { get { return linha; } }
+    public bool Pronto { get { return carregado; } }
+    public bool Salvando { get { return salvando; } }
+    public string UltimoSalvo;   // para os testes
+
+    readonly string arquivo;
+    readonly System.Windows.Forms.Integration.ElementHost host;
+    readonly System.Windows.Controls.MediaElement video;
+    readonly LinhaDoTempo linha;
+    readonly Label botaoPlay, tempo, trecho, rotuloVolume, botaoMudo, salvarNovo, substituir, aviso;
+    readonly Deslizador volume;
+    readonly ToolTip dicas = new ToolTip();
+    readonly Timer relogio;
+    readonly Icon icone;
+    bool tocando, carregado, salvando, mudo;
+
+    // area: onde abrir (o teste usa); sem ela, a tela onde esta o mouse
+    public EditorClipe(string arquivo, Rectangle? area = null)
+    {
+        this.arquivo = arquivo;
+        Atual = this;
+        icone = Tema.CriarIcone();
+        Icon = icone;
+        Text = "Editar clipe - " + Path.GetFileName(arquivo);
+        FormBorderStyle = FormBorderStyle.None;
+        StartPosition = FormStartPosition.Manual;
+        BackColor = Tema.Fundo;
+        KeyPreview = true;
+        Bounds = area ?? Screen.FromPoint(Cursor.Position).WorkingArea;
+
+        // ---- Topo: nome e botoes ----
+        // Os paineis ja nascem com a largura da janela: os botoes ancorados a
+        // direita medem a distancia da borda a partir daqui
+        int largura = ClientSize.Width;
+        Panel topo = new Panel();
+        topo.Dock = DockStyle.Top;
+        topo.SetBounds(0, 0, largura, 48);
+        topo.BackColor = Tema.Fundo;
+        Label titulo = Rotulo(Path.GetFileName(arquivo), Tema.Titulo, Tema.Texto);
+        titulo.SetBounds(16, 0, 700, 48);
+        topo.Controls.Add(titulo);
+        Label fechar = Botao("✕", 44, "Fechar (Esc)");
+        fechar.Location = new Point(largura - 54, 7);
+        fechar.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        fechar.Click += delegate { Close(); };
+        topo.Controls.Add(fechar);
+        Label player = Botao("Abrir no player", 130, "Assistir no player do Windows");
+        player.Location = new Point(largura - 54 - 136, 7);
+        player.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        player.Click += delegate { AbrirNoPlayer(); };
+        topo.Controls.Add(player);
+
+        // ---- Video ----
+        host = new System.Windows.Forms.Integration.ElementHost();
+        host.Dock = DockStyle.Fill;
+        host.BackColor = Color.Black;
+        video = new System.Windows.Controls.MediaElement();
+        video.LoadedBehavior = System.Windows.Controls.MediaState.Manual;
+        video.UnloadedBehavior = System.Windows.Controls.MediaState.Manual;
+        video.ScrubbingEnabled = true;
+        video.IsMuted = true;   // sem "bip" enquanto abre (toca um instante para carregar)
+        video.MouseLeftButtonUp += delegate { Alternar(); };   // clicar no video toca ou pausa
+        video.MediaOpened += delegate { Abriu(); };
+        video.MediaEnded += delegate { if (tocando) Ir(linha.Inicio); };
+        video.MediaFailed += delegate(object s, System.Windows.ExceptionRoutedEventArgs e)
+        {
+            App.Log("Erro ao abrir o clipe no editor: " + e.ErrorException.Message);
+            Aviso.Mostrar("Não deu para abrir o vídeo aqui", "Abrindo no player do Windows", Tema.Perigo);
+            AbrirNoPlayer();
+        };
+        host.Child = video;
+
+        // ---- Base: linha do tempo, controles e salvar ----
+        Panel baseP = new Panel();
+        baseP.Dock = DockStyle.Bottom;
+        baseP.SetBounds(0, 0, largura, 164);
+        baseP.BackColor = Tema.Fundo;
+
+        linha = new LinhaDoTempo();
+        linha.SetBounds(10, 6, largura - 20, 84);
+        linha.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+        linha.Mudou += delegate { Atualizar(); };
+        linha.Buscou += delegate(double t) { Ir(t); };
+        baseP.Controls.Add(linha);
+
+        int y = 100;
+        botaoPlay = Botao("▶", 52, "Tocar ou pausar (Espaço)");
+        botaoPlay.Font = new Font("Segoe UI Symbol", 13f);
+        botaoPlay.Location = new Point(24, y);
+        botaoPlay.Click += delegate { Alternar(); };
+        baseP.Controls.Add(botaoPlay);
+
+        tempo = Rotulo("0:00,0 / 0:00,0", Tema.Mono, Tema.Texto);
+        tempo.SetBounds(86, y, 190, 34);
+        baseP.Controls.Add(tempo);
+
+        Label marcarIni = Botao("Início aqui", 96, "Começar o corte no cursor (I)");
+        marcarIni.Location = new Point(280, y);
+        marcarIni.Click += delegate { linha.DefinirInicio(linha.Posicao); };
+        baseP.Controls.Add(marcarIni);
+        Label marcarFim = Botao("Fim aqui", 84, "Terminar o corte no cursor (O)");
+        marcarFim.Location = new Point(380, y);
+        marcarFim.Click += delegate { linha.DefinirFim(linha.Posicao); };
+        baseP.Controls.Add(marcarFim);
+
+        // Tela estreita (monitor em pe): o trecho e o som descem para uma segunda linha
+        bool estreito = largura < 1500;
+        int y2 = estreito ? y + 42 : y, sx = estreito ? 370 : 812;
+        if (estreito) baseP.Height = 206;
+
+        trecho = Rotulo("", Tema.Normal, Tema.Suave);
+        trecho.SetBounds(estreito ? 24 : 476, y2, 330, 34);
+        baseP.Controls.Add(trecho);
+
+        Label som = Rotulo("Som", Tema.Negrito, Tema.Texto);
+        som.SetBounds(sx, y2, 40, 34);
+        baseP.Controls.Add(som);
+        volume = new Deslizador();
+        volume.Minimo = 0; volume.Maximo = 200; volume.Valor = 100;
+        volume.BackColor = Tema.Fundo;
+        volume.SetBounds(sx + 40, y2 + 2, 170, 30);
+        volume.Mexeu += delegate { mudo = false; Atualizar(); };
+        baseP.Controls.Add(volume);
+        rotuloVolume = Rotulo("100%", Tema.Normal, Tema.Texto);
+        rotuloVolume.SetBounds(sx + 212, y2, 52, 34);
+        rotuloVolume.Cursor = Cursors.Hand;
+        rotuloVolume.Click += delegate { volume.Valor = 100; mudo = false; Atualizar(); };
+        dicas.SetToolTip(rotuloVolume, "Clique para voltar a 100%");
+        baseP.Controls.Add(rotuloVolume);
+        botaoMudo = Botao("Mudo", 64, "Tirar o som do clipe (M)");
+        botaoMudo.Location = new Point(sx + 268, y2);
+        botaoMudo.Click += delegate { mudo = !mudo; Atualizar(); };
+        baseP.Controls.Add(botaoMudo);
+
+        salvarNovo = Botao("Salvar como novo", 150, "Salva o trecho num arquivo novo, ao lado do original (Ctrl + S)");
+        salvarNovo.BackColor = Tema.Destaque;
+        salvarNovo.Font = Tema.Negrito;
+        salvarNovo.Location = new Point(largura - 24 - 150, y);
+        salvarNovo.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        salvarNovo.MouseEnter += delegate { salvarNovo.BackColor = ControlPaint.Light(Tema.Destaque, 0.15f); };
+        salvarNovo.MouseLeave += delegate { salvarNovo.BackColor = Tema.Destaque; };
+        salvarNovo.Click += delegate { Salvar(false); };
+        baseP.Controls.Add(salvarNovo);
+        substituir = Botao("Substituir original", 150, "Troca o original pelo corte (o original vai para a Lixeira)");
+        substituir.Location = new Point(largura - 24 - 150 - 156, y);
+        substituir.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        substituir.Click += delegate { Salvar(true); };
+        baseP.Controls.Add(substituir);
+
+        aviso = Rotulo("Espaço toca  •  I e O marcam início e fim  •  ← → andam um quadro (Shift: 1 s)  •  o início encaixa no quadro-chave mais perto, para salvar sem perder qualidade",
+                       Tema.Pequena, Tema.Suave);
+        aviso.SetBounds(24, y2 + 40, largura - 48, 20);
+        aviso.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+        baseP.Controls.Add(aviso);
+
+        Controls.Add(host);
+        Controls.Add(baseP);
+        Controls.Add(topo);
+
+        relogio = new Timer();
+        relogio.Interval = 33;
+        relogio.Tick += delegate { Andou(); };
+
+        Atualizar();
+        video.Source = new Uri(arquivo);
+        video.Play();   // abre o arquivo; pausa assim que abrir
+    }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+#if TESTE
+        if (SemFoco) return;   // o teste tira foto da janela
+#endif
+        Capturas.Esconder(Handle);   // o editor nao sai nos clipes
+    }
+
+    Label Rotulo(string texto, Font fonte, Color cor)
+    {
+        Label l = new Label();
+        l.Text = texto; l.Font = fonte; l.ForeColor = cor; l.BackColor = Color.Transparent;
+        l.UseMnemonic = false; l.TextAlign = ContentAlignment.MiddleLeft; l.AutoEllipsis = true;
+        return l;
+    }
+
+    Label Botao(string texto, int largura, string dica)
+    {
+        Label l = Rotulo(texto, Tema.Normal, Tema.Texto);
+        l.TextAlign = ContentAlignment.MiddleCenter;
+        l.Size = new Size(largura, 34);
+        l.BackColor = Tema.Campo;
+        l.Cursor = Cursors.Hand;
+        l.MouseEnter += delegate { if (l.BackColor == Tema.Campo) l.BackColor = Tema.CampoSob; };
+        l.MouseLeave += delegate { if (l.BackColor == Tema.CampoSob) l.BackColor = Tema.Campo; };
+        dicas.SetToolTip(l, dica);
+        return l;
+    }
+
+    void Abriu()
+    {
+        video.Pause();
+        video.IsMuted = false;
+        tocando = false;
+        CorteClipe.Info info = CorteClipe.Ler(arquivo);
+        double dur = video.NaturalDuration.HasTimeSpan ? video.NaturalDuration.TimeSpan.TotalSeconds : (info != null ? info.Duracao : 0);
+        if (dur <= 0 && info != null) dur = info.Duracao;
+        linha.Info = info;
+        linha.Duracao = Math.Max(0.1, dur);
+        linha.Inicio = 0;
+        linha.Fim = linha.Duracao;
+        linha.Posicao = 0;
+        Ir(0);
+        carregado = true;
+        Atualizar();
+        // Miniaturas em fundo
+        int quantas = Math.Max(4, Math.Min(24, linha.Width / 110));
+        string arq = arquivo;
+        double d = linha.Duracao;
+        System.Threading.Thread t = new System.Threading.Thread(delegate()
+        {
+            Bitmap b = CorteClipe.Miniaturas(arq, d, quantas, 64);
+            if (b == null) return;
+            try { BeginInvoke((MethodInvoker)delegate { if (IsDisposed) { b.Dispose(); return; } linha.Faixa = b; linha.Invalidate(); }); }
+            catch { b.Dispose(); }
+        });
+        t.IsBackground = true;
+        t.Start();
+    }
+
+    double Posicao { get { return video.Position.TotalSeconds; } }
+
+    void Ir(double t)
+    {
+        t = Math.Max(0, Math.Min(linha.Duracao, t));
+        video.Position = TimeSpan.FromSeconds(t);
+        linha.Posicao = t;
+        linha.Invalidate();
+        AtualizarTempo();
+    }
+
+    public void Alternar()
+    {
+        if (!carregado) return;
+        if (tocando) { video.Pause(); tocando = false; relogio.Stop(); }
+        else
+        {
+            if (linha.Posicao < linha.Inicio || linha.Posicao >= linha.Fim - 0.05) Ir(linha.Inicio);
+            video.Play();
+            tocando = true;
+            relogio.Start();
+        }
+        botaoPlay.Text = tocando ? "⏸" : "▶";
+    }
+
+    // Tocando: o cursor acompanha e o trecho repete
+    void Andou()
+    {
+        if (!tocando) return;
+        double p = Posicao;
+        if (p >= linha.Fim) { Ir(linha.Inicio); return; }
+        linha.Posicao = p;
+        linha.Invalidate();
+        AtualizarTempo();
+    }
+
+    void AtualizarTempo()
+    {
+        tempo.Text = CorteClipe.Tempo(linha.Posicao) + " / " + CorteClipe.Tempo(linha.Duracao);
+    }
+
+    void Atualizar()
+    {
+        video.Volume = mudo ? 0 : Math.Min(1.0, volume.Valor / 100.0);
+        rotuloVolume.Text = mudo ? "mudo" : volume.Valor + "%";
+        botaoMudo.BackColor = mudo ? Tema.Selecao : Tema.Campo;
+        trecho.Text = carregado
+            ? "Trecho: " + CorteClipe.Tempo(linha.Inicio) + " até " + CorteClipe.Tempo(linha.Fim) + Tema.Ponto +
+              (linha.Fim - linha.Inicio).ToString("0.0", CultureInfo.GetCultureInfo("pt-BR")) + " s"
+            : "Abrindo...";
+        bool mexeu = carregado && (linha.Inicio > 0.01 || linha.Fim < linha.Duracao - 0.01 || mudo || volume.Valor != 100);
+        salvarNovo.Enabled = substituir.Enabled = mexeu && !salvando;
+        salvarNovo.ForeColor = substituir.ForeColor = mexeu && !salvando ? Tema.Texto : Tema.Suave;
+        AtualizarTempo();
+    }
+
+    protected override bool ProcessCmdKey(ref Message msg, Keys k)
+    {
+        double quadro = linha.Info != null && linha.Info.Quadro > 0 ? linha.Info.Quadro : 1 / 60.0;
+        switch (k)
+        {
+            case Keys.Escape: Close(); return true;
+            case Keys.Space: Alternar(); return true;
+            case Keys.I: linha.DefinirInicio(linha.Posicao); return true;
+            case Keys.O: linha.DefinirFim(linha.Posicao); return true;
+            case Keys.M: mudo = !mudo; Atualizar(); return true;
+            case Keys.Home: Ir(linha.Inicio); return true;
+            case Keys.End: Ir(linha.Fim); return true;
+            case Keys.Left: Pausar(); Ir(linha.Posicao - quadro); return true;
+            case Keys.Right: Pausar(); Ir(linha.Posicao + quadro); return true;
+            case Keys.Shift | Keys.Left: Ir(linha.Posicao - 1); return true;
+            case Keys.Shift | Keys.Right: Ir(linha.Posicao + 1); return true;
+            case Keys.Control | Keys.S: Salvar(false); return true;
+        }
+        return base.ProcessCmdKey(ref msg, k);
+    }
+
+    void Pausar()
+    {
+        if (!tocando) return;
+        video.Pause(); tocando = false; relogio.Stop();
+        botaoPlay.Text = "▶";
+    }
+
+    public void Salvar(bool trocarOriginal)
+    {
+        if (!carregado || salvando) return;
+        Pausar();
+        salvando = true;
+        Atualizar();
+        string destino = trocarOriginal
+            ? Path.Combine(Path.GetDirectoryName(arquivo), "." + Path.GetFileNameWithoutExtension(arquivo) + "-editando.mp4")
+            : CorteClipe.NomeNovo(arquivo);
+        double ini = linha.Inicio, fim = linha.Fim;
+        int vol = volume.Valor;
+        bool semSom = mudo;
+        trecho.Text = "Salvando...";
+        System.Threading.Thread t = new System.Threading.Thread(delegate()
+        {
+            string erro = CorteClipe.Exportar(arquivo, destino, ini, fim, vol, semSom);
+            BeginInvoke((MethodInvoker)delegate { Salvou(erro, destino, trocarOriginal); });
+        });
+        t.Start();
+    }
+
+    void Salvou(string erro, string destino, bool trocarOriginal)
+    {
+        salvando = false;
+        if (erro != null)
+        {
+            Aviso.Mostrar("Não deu para salvar o corte", erro, Tema.Perigo);
+            Atualizar();
+            return;
+        }
+        if (trocarOriginal)
+        {
+            // O player segura o arquivo: solta e espera ficar livre (sem travar a janela)
+            video.Stop();
+            video.Close();
+            video.Source = null;
+            int tentativas = 0;
+            Timer espera = new Timer();
+            espera.Interval = 150;
+            espera.Tick += delegate
+            {
+                tentativas++;
+                bool livre = Livre(arquivo);
+                if (!livre && tentativas < 30) return;
+                espera.Stop();
+                espera.Dispose();
+                Concluir(Trocar(destino, livre), true);
+            };
+            espera.Start();
+            return;
+        }
+        Concluir(destino, false);
+    }
+
+    static bool Livre(string arq)
+    {
+        try { using (new FileStream(arq, FileMode.Open, FileAccess.ReadWrite, FileShare.None)) return true; }
+        catch { return false; }
+    }
+
+    // Original para a Lixeira (sem janela nenhuma: um dialogo tiraria o foco do
+    // jogo) e o corte no lugar dele. Se nao der, o corte fica como arquivo novo.
+    string Trocar(string temporario, bool livre)
+    {
+        string original = arquivo;
+        if (livre && Lixeira.Mandar(original))
+        {
+            string final = Path.ChangeExtension(original, ".mp4");
+            if (File.Exists(final)) final = CorteClipe.NomeNovo(original);
+            try { File.Move(temporario, final); return final; }
+            catch (Exception ex) { App.Log("Erro ao pôr o corte no lugar: " + ex.Message); }
+        }
+        else App.Log("Não deu para mandar o original para a Lixeira (" + (livre ? "a Lixeira recusou" : "arquivo em uso") + ")");
+        string novo = CorteClipe.NomeNovo(original);
+        try { File.Move(temporario, novo); } catch { novo = temporario; }
+        Aviso.Mostrar("Não deu para trocar o original", "O corte foi salvo como " + Path.GetFileName(novo), Tema.Perigo);
+        return novo;
+    }
+
+    void Concluir(string final, bool trocarOriginal)
+    {
+        UltimoSalvo = final;
+        long tam = 0;
+        try { tam = new FileInfo(final).Length; } catch { }
+        if (Config.SomAoCapturar) Som.Tocar();
+        Aviso.Mostrar(trocarOriginal ? "Clipe substituído" : "Corte salvo",
+                      (linha.Fim - linha.Inicio).ToString("0.0", CultureInfo.GetCultureInfo("pt-BR")) + " s" + Tema.Ponto +
+                      Replay.Tamanho(tam) + Tema.Ponto + Path.GetFileName(final), Tema.Sucesso);
+        voltarParaGaleria = true;
+        Close();
+    }
+
+    bool voltarParaGaleria;
+
+#if TESTE
+    public bool SemFoco;   // o teste abre o editor fora da tela, sem tirar o foco de quem esta usando o PC
+    protected override bool ShowWithoutActivation { get { return SemFoco; } }
+    public void Mudo(bool m) { mudo = m; Atualizar(); }
+    public void Volume(int v) { volume.Valor = v; Atualizar(); }
+    public bool TocandoAgora { get { return tocando; } }
+
+    // Foto da janela fora da tela: os controles e, no lugar do video, o quadro atual
+    public Bitmap Foto()
+    {
+        Bitmap b = new Bitmap(Width, Height);
+        DrawToBitmap(b, new Rectangle(0, 0, Width, Height));
+        int w = host.Width, h = host.Height;
+        var r = new System.Windows.Media.Imaging.RenderTargetBitmap(w, h, 96, 96, System.Windows.Media.PixelFormats.Pbgra32);
+        video.Measure(new System.Windows.Size(w, h));
+        video.Arrange(new System.Windows.Rect(0, 0, w, h));
+        r.Render(video);
+        byte[] px = new byte[w * h * 4];
+        r.CopyPixels(px, w * 4, 0);
+        using (Bitmap v = new Bitmap(w, h, PixelFormat.Format32bppPArgb))
+        {
+            BitmapData d = v.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.WriteOnly, PixelFormat.Format32bppPArgb);
+            Marshal.Copy(px, 0, d.Scan0, px.Length);
+            v.UnlockBits(d);
+            using (Graphics g = Graphics.FromImage(b))
+            {
+                g.FillRectangle(Brushes.Black, host.Left, host.Top, w, h);
+                g.DrawImage(v, host.Left, host.Top);
+            }
+        }
+        return b;
+    }
+#endif
+
+    void AbrirNoPlayer()
+    {
+        try
+        {
+            ProcessStartInfo i = new ProcessStartInfo(arquivo);
+            i.UseShellExecute = true;
+            Process.Start(i);
+        }
+        catch (Exception ex) { App.Log("Erro ao abrir no player: " + ex.Message); }
+        Close();
+    }
+
+    protected override void OnFormClosed(FormClosedEventArgs e)
+    {
+        relogio.Stop();
+        try { video.Stop(); video.Close(); video.Source = null; } catch { }
+        if (Atual == this) Atual = null;
+        base.OnFormClosed(e);
+        if (voltarParaGaleria) App.AbrirGaleria();
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        base.Dispose(disposing);
+        if (disposing)
+        {
+            relogio.Dispose();
+            dicas.Dispose();
+            icone.Dispose();
+            if (linha.Faixa != null) { linha.Faixa.Dispose(); linha.Faixa = null; }
+        }
+    }
+
+    // Abre o editor; se o WPF ou o player faltarem, cai no player do Windows
+    public static void Abrir(string arquivo)
+    {
+        try
+        {
+            if (Atual != null) Atual.Close();
+            EditorClipe e = new EditorClipe(arquivo);
+            e.Show();
+            e.Activate();
+            Nativo.SetForegroundWindow(e.Handle);
+        }
+        catch (Exception ex)
+        {
+            App.Log("Erro ao abrir o editor de clipe: " + ex);
+            try { ProcessStartInfo i = new ProcessStartInfo(arquivo); i.UseShellExecute = true; Process.Start(i); } catch { }
+        }
+    }
+}
+
+// Manda para a Lixeira sem mostrar janela nenhuma (nem de erro, nem de confirmacao)
+static class Lixeira
+{
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode, Pack = 1)]   // o programa e 32 bits: o Windows usa pack 1
+    struct Operacao
+    {
+        public IntPtr Janela;
+        public uint Funcao;
+        public string De, Para;
+        public ushort Opcoes;
+        public int Cancelada;
+        public IntPtr Nomes;
+        public string Titulo;
+    }
+
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)] static extern int SHFileOperation(ref Operacao op);
+
+    public static bool Mandar(string arquivo)
+    {
+        try
+        {
+            Operacao op = new Operacao();
+            op.Funcao = 3;                         // FO_DELETE
+            op.De = Path.GetFullPath(arquivo) + "\0\0";
+            op.Opcoes = 0x0040 | 0x0010 | 0x0004 | 0x0400;   // desfazivel (Lixeira), sem confirmar, silencioso, sem janela de erro
+            int r = SHFileOperation(ref op);
+            return r == 0 && op.Cancelada == 0 && !File.Exists(arquivo);
+        }
+        catch (Exception ex) { App.Log("Erro ao mandar para a Lixeira: " + ex.Message); return false; }
+    }
+}
+
 // Janelas que nao devem aparecer nos clipes, gravacoes e prints (Windows 10 2004+)
 static class Capturas
 {
@@ -8677,8 +9630,9 @@ class Galeria : Form
         ContextMenuStrip menu = CoresMenu.NovoMenu();
         if (um)
         {
-            ToolStripItem abrir = menu.Items.Add(m.Video ? "Assistir" : "Abrir no editor", null, delegate { Abrir(m); });
+            ToolStripItem abrir = menu.Items.Add(m.Video ? "Cortar e ajustar" : "Abrir no editor", null, delegate { Abrir(m); });
             abrir.Font = Tema.Negrito;
+            if (m.Video) menu.Items.Add("Assistir no player", null, delegate { Abrir(m, true); });
         }
         menu.Items.Add(um ? (m.Video ? "Copiar o arquivo" : "Copiar a imagem") : "Copiar " + alvo.Count + " arquivos", null, delegate { Copiar(alvo); });
         menu.Items.Add("Mostrar na pasta", null, delegate { MostrarVarios(alvo); });
@@ -8691,14 +9645,16 @@ class Galeria : Form
         menu.Show(tela);
     }
 
-    void Abrir(Midia m)
+    // Video: o editor de clipe (cortar e som); noPlayer = o player do Windows
+    void Abrir(Midia m, bool noPlayer = false)
     {
         if (!File.Exists(m.Caminho)) { Carregar(); return; }
         abrindo = true;
         Close();
         try
         {
-            if (m.Video)
+            if (m.Video && !noPlayer) AbrirEditorDeClipe(m.Caminho);
+            else if (m.Video)
             {
                 ProcessStartInfo i = new ProcessStartInfo(m.Caminho);
                 i.UseShellExecute = true;
@@ -8712,6 +9668,11 @@ class Galeria : Form
             MostrarNaPasta(m.Caminho);
         }
     }
+
+    // Num metodo a parte: se faltar o WPF no Windows, o erro de carregar o
+    // editor acontece aqui dentro e cai no catch de quem chamou (abre no player)
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    static void AbrirEditorDeClipe(string arquivo) { EditorClipe.Abrir(arquivo); }
 
     static void MostrarNaPasta(string arq)
     {

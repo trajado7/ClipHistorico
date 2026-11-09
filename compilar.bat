@@ -25,8 +25,12 @@ taskkill /IM TrajadoTools.exe /F >nul 2>&1
 taskkill /IM ClipHistorico.exe /F >nul 2>&1
 timeout /t 1 /nobreak >nul
 
+rem WPF: so o editor de clipe usa (o video toca pelo Windows Media Player)
+set "WPF=%WINDIR%\Microsoft.NET\Framework\v4.0.30319\WPF"
+set "REFWPF=/lib:"%WPF%" /r:PresentationCore.dll /r:PresentationFramework.dll /r:WindowsBase.dll /r:WindowsFormsIntegration.dll /r:System.Xaml.dll"
+
 rem x86 = versao 32 bits, que usa menos memoria
-"%CSC%" /nologo /target:winexe /platform:x86 /optimize+ /debug- %ICONE% /resource:emojis.gz,emojis.gz /out:TrajadoTools.exe /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.IO.Compression.dll /r:Microsoft.VisualBasic.dll TrajadoTools.cs
+"%CSC%" /nologo /target:winexe /platform:x86 /optimize+ /debug- %ICONE% /resource:emojis.gz,emojis.gz /out:TrajadoTools.exe /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.IO.Compression.dll /r:Microsoft.VisualBasic.dll %REFWPF% TrajadoTools.cs
 
 if errorlevel 1 (
     echo.

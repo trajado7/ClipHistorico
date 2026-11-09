@@ -887,6 +887,188 @@ static class Teste
         foreach (string f in Directory.GetFiles(clipes, "gravacao-*")) File.Delete(f);
     }
 
+    // ---- Editor de clipe ----
+    static double DuracaoExata(string arq)
+    {
+        string s = Sondar(arq);
+        int i = s.IndexOf("Duration: ");
+        TimeSpan t;
+        if (i < 0 || !TimeSpan.TryParse(s.Substring(i + 10, 11), System.Globalization.CultureInfo.InvariantCulture, out t)) return -1;
+        return t.TotalSeconds;
+    }
+
+    // Volume medio do som (dB), pelo volumedetect do ffmpeg
+    static double VolumeMedio(string arq)
+    {
+        string s;
+        Ffmpeg.Rodar("-hide_banner -nostdin -i " + Ffmpeg.Aspas(arq) + " -map 0:a -af volumedetect -f null -", null, 60000, out s);
+        int i = s.IndexOf("mean_volume: ");
+        if (i < 0) return double.NaN;
+        string v = s.Substring(i + 13).Split(' ')[0];
+        return double.Parse(v, System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    static void TestarEditorClipe(string saida)
+    {
+        string pasta = Path.Combine(saida, "editor");
+        if (Directory.Exists(pasta)) Directory.Delete(pasta, true);
+        Directory.CreateDirectory(pasta);
+        if (Ffmpeg.Caminho == null) { Ok(false, "ffmpeg encontrado"); return; }
+
+        // Um clipe feito como o replay faz: pedacos .ts de 1 s emendados num .mp4
+        string seg;
+        int c = Ffmpeg.Rodar("-hide_banner -loglevel error -nostdin -y -f lavfi -i testsrc2=s=1280x720:r=60 -f lavfi -i sine=f=440:r=48000 -t 8 " +
+                             "-map 0:v -map 1:a -c:v h264_nvenc -preset p4 -tune hq -rc vbr -b:v 20000k -forced-idr 1 -g 60 -pix_fmt yuv420p " +
+                             "-c:a aac -b:a 192k -ac 2 -ar 48000 -force_key_frames \"expr:gte(t,n_forced*1)\" -f segment -segment_time 1 " +
+                             "-segment_format mpegts p%02d.ts", pasta, 60000, out seg);
+        Ok(c == 0, "pedacos do clipe de teste: " + Ffmpeg.Resumo(seg));
+        List<string> ps = new List<string>();
+        foreach (string f in Directory.GetFiles(pasta, "p*.ts")) ps.Add(Path.GetFileName(f));
+        ps.Sort();
+        string clipe = Path.Combine(pasta, "clipe-teste.mp4");
+        c = Ffmpeg.Rodar("-hide_banner -loglevel error -nostdin -y -i \"concat:" + string.Join("|", ps.ToArray()) + "\" -map 0 -c copy -movflags +faststart clipe-teste.mp4", pasta, 60000, out seg);
+        Ok(c == 0 && File.Exists(clipe), "clipe de teste montado");
+
+        // Indice do .mp4
+        Stopwatch sw = Stopwatch.StartNew();
+        CorteClipe.Info info = CorteClipe.Ler(clipe);
+        Console.WriteLine("leu o indice em " + sw.ElapsedMilliseconds + " ms");
+        Ok(info != null, "leu o indice do mp4");
+        if (info == null) return;
+        Console.WriteLine("duracao " + info.Duracao.ToString("0.000") + " s, quadro " + info.Quadro.ToString("0.0000") + ", chaves: " +
+                          string.Join(" ", info.Chaves.ConvertAll(x => x.ToString("0.000")).ToArray()));
+        Ok(Math.Abs(info.Duracao - 8) < 0.15, "duracao lida: " + info.Duracao);
+        Ok(Math.Abs(info.Quadro - 1 / 60.0) < 0.001, "duracao do quadro: " + info.Quadro);
+        // O que o ffmpeg acha, decodificando so os quadros-chave
+        string sk;
+        Ffmpeg.Rodar("-hide_banner -nostdin -skip_frame nokey -i " + Ffmpeg.Aspas(clipe) + " -map 0:v -vf showinfo -f null -", null, 60000, out sk);
+        List<double> reais = new List<double>();
+        foreach (string l in sk.Split('\n'))
+        {
+            int i = l.IndexOf("pts_time:");
+            if (i < 0) continue;
+            reais.Add(double.Parse(l.Substring(i + 9).Split(' ')[0], System.Globalization.CultureInfo.InvariantCulture));
+        }
+        Console.WriteLine("chaves pelo ffmpeg: " + string.Join(" ", reais.ConvertAll(x => x.ToString("0.000")).ToArray()));
+        bool iguais = reais.Count == info.Chaves.Count;
+        for (int i = 0; iguais && i < reais.Count; i++) iguais = Math.Abs(reais[i] - info.Chaves[i]) < 0.02;
+        Ok(iguais, "quadros-chave batem com os do ffmpeg (" + info.Chaves.Count + ")");
+        Ok(CorteClipe.ChaveMaisPerto(info, 2.4) == info.Chaves[2] && CorteClipe.ChaveMaisPerto(info, 2.6) == info.Chaves[3], "encaixa no quadro-chave mais perto");
+        Ok(CorteClipe.Ler(Path.Combine(pasta, ps[0])) == null, ".ts nao tem indice (vai recodificar)");
+
+        // Corte sem recodificar
+        double ini = info.Chaves[2];
+        string corte = CorteClipe.NomeNovo(clipe);
+        Ok(Path.GetFileName(corte) == "clipe-teste-corte.mp4", "nome do corte: " + Path.GetFileName(corte));
+        sw.Restart();
+        string erro = CorteClipe.Exportar(clipe, corte, ini, 5.5, 100, false);
+        Console.WriteLine("cortou em " + sw.ElapsedMilliseconds + " ms");
+        Ok(erro == null, "cortou sem erro: " + erro);
+        double d = DuracaoExata(corte);
+        Ok(Math.Abs(d - (5.5 - ini)) < 0.12, "corte tem o trecho escolhido: " + d.ToString("0.00") + " s (esperado " + (5.5 - ini).ToString("0.00") + ")");
+        string s = Sondar(corte);
+        Ok(s.Contains("Video: h264") && s.Contains("Audio: aac"), "corte tem video e som");
+        string er;
+        int cod = Ffmpeg.Rodar("-hide_banner -v error -i " + Ffmpeg.Aspas(corte) + " -f null -", null, 60000, out er);
+        Ok(cod == 0 && er.Trim().Length == 0, "corte decodifica sem erro: " + er);
+        CorteClipe.Info ic = CorteClipe.Ler(corte);
+        // o video comeca num quadro-chave (com o pequeno atraso do som, como nos clipes)
+        Ok(ic != null && ic.Chaves.Count > 0 && ic.Chaves[0] < 0.1, "corte comeca num quadro-chave: " + (ic == null || ic.Chaves.Count == 0 ? "?" : ic.Chaves[0].ToString("0.000")));
+        Ok(NomeNovoSegue(clipe), "segundo corte ganha outro nome");
+
+        // Sem som e volume
+        string mudo = Path.Combine(pasta, "mudo.mp4");
+        Ok(CorteClipe.Exportar(clipe, mudo, ini, 5.5, 100, true) == null && !Sondar(mudo).Contains("Audio:"), "mudo tira o som");
+        string alto = Path.Combine(pasta, "alto.mp4");
+        Ok(CorteClipe.Exportar(clipe, alto, ini, 5.5, 150, false) == null, "volume 150% salvou");
+        double v1 = VolumeMedio(corte), v2 = VolumeMedio(alto);
+        Console.WriteLine("volume: normal " + v1 + " dB, 150% " + v2 + " dB");
+        Ok(v2 - v1 > 3 && v2 - v1 < 4.5, "150% fica ~3,5 dB mais alto: " + (v2 - v1).ToString("0.0") + " dB");
+        Ok(Math.Abs(DuracaoExata(alto) - (5.5 - ini)) < 0.12, "volume nao mexe no corte");
+
+        // Arquivo .ts (gravacao recuperada): recodifica no ponto exato
+        string dets = Path.Combine(pasta, "de-ts.mp4");
+        Ok(CorteClipe.Exportar(Path.Combine(pasta, ps[0]), dets, 0.2, 0.8, 100, false) == null, ".ts recodificado");
+        double dt = DuracaoExata(dets);
+        Ok(Math.Abs(dt - 0.6) < 0.1, ".ts cortado no ponto exato: " + dt.ToString("0.00"));
+
+        // Miniaturas
+        sw.Restart();
+        Bitmap faixa = CorteClipe.Miniaturas(clipe, info.Duracao, 10, 64);
+        Console.WriteLine("miniaturas em " + sw.ElapsedMilliseconds + " ms: " + (faixa == null ? "nada" : faixa.Width + "x" + faixa.Height));
+        Ok(faixa != null && faixa.Height == 64 && faixa.Width >= 10 * 110, "faixa com 10 miniaturas");
+        if (faixa != null) { faixa.Save(Path.Combine(pasta, "faixa.png")); faixa.Dispose(); }
+        Ok(CorteClipe.Tempo(65.25) == "1:05,3" || CorteClipe.Tempo(65.25) == "1:05,2", "tempo na tela: " + CorteClipe.Tempo(65.25));
+
+        // A janela de verdade, fora da tela e sem tirar o foco
+        WindowsFormsSynchronizationContext ctx = new WindowsFormsSynchronizationContext();
+        System.Threading.SynchronizationContext.SetSynchronizationContext(ctx);
+        EditorClipe e = new EditorClipe(clipe, new Rectangle(-4000, 0, 1600, 900));
+        e.SemFoco = true;
+        e.Show();
+        Ok(Esperar(delegate { return e.Pronto; }, 15000), "editor abriu o video");
+        if (!e.Pronto) { e.Close(); return; }
+        Ok(Math.Abs(e.Linha.Duracao - 8) < 0.15, "editor: duracao " + e.Linha.Duracao);
+        Ok(Esperar(delegate { return e.Linha.Faixa != null; }, 15000), "editor: miniaturas chegaram");
+        e.Linha.DefinirInicio(1.3);
+        Ok(Math.Abs(e.Linha.Inicio - info.Chaves[1]) < 0.001, "editor: inicio encaixou no quadro-chave: " + e.Linha.Inicio);
+        // Foto da janela (com o video), para conferir o visual
+        e.Linha.DefinirFim(6.5);
+        Esperar(delegate { return false; }, 600);
+        using (Bitmap foto = e.Foto()) foto.Save(Path.Combine(pasta, "editor.png"));
+        // e numa tela em pe (1080 de largura)
+        EditorClipe ep = new EditorClipe(clipe, new Rectangle(-4000, 0, 1080, 1880));
+        ep.SemFoco = true;
+        ep.Show();
+        Esperar(delegate { return ep.Pronto && ep.Linha.Faixa != null; }, 15000);
+        ep.Linha.DefinirFim(6.5);
+        Esperar(delegate { return false; }, 400);
+        using (Bitmap foto = ep.Foto()) foto.Save(Path.Combine(pasta, "editor-em-pe.png"));
+        ep.Close();
+        e.Linha.DefinirFim(0.5);
+        Ok(e.Linha.Fim >= e.Linha.Inicio + LinhaDoTempo.Minimo - 0.001, "editor: fim nunca passa do inicio");
+        e.Linha.DefinirFim(4.25);
+        e.Alternar();
+        Esperar(delegate { return false; }, 1200);
+        double andou = e.Linha.Posicao;
+        e.Alternar();
+        Console.WriteLine("tocou ate " + andou.ToString("0.00") + " s");
+        Ok(andou > e.Linha.Inicio + 0.6 && andou < e.Linha.Inicio + 2, "editor: tocar anda o cursor: " + andou.ToString("0.00"));
+        e.Alternar();
+        Esperar(delegate { return false; }, 3500);   // passa do fim: volta ao inicio
+        double rodou = e.Linha.Posicao;
+        e.Alternar();
+        Ok(rodou >= e.Linha.Inicio && rodou <= e.Linha.Fim, "editor: toca em loop so o trecho: " + rodou.ToString("0.00"));
+        e.Volume(50);
+        e.Salvar(false);
+        Ok(Esperar(delegate { return e.IsDisposed || !e.Visible; }, 30000), "editor: salvou e fechou");
+        string feito = e.UltimoSalvo;
+        Ok(feito != null && File.Exists(feito), "editor: arquivo novo " + (feito == null ? "" : Path.GetFileName(feito)));
+        if (feito != null && File.Exists(feito))
+            Ok(Math.Abs(DuracaoExata(feito) - (4.25 - info.Chaves[1])) < 0.12, "editor: trecho certo no arquivo: " + DuracaoExata(feito).ToString("0.00"));
+
+        // Substituir o original
+        string copia = Path.Combine(pasta, "substituir.mp4");
+        File.Copy(clipe, copia);
+        EditorClipe e2 = new EditorClipe(copia, new Rectangle(-4000, 0, 1600, 900));
+        e2.SemFoco = true;
+        e2.Show();
+        Ok(Esperar(delegate { return e2.Pronto; }, 15000), "editor 2 abriu");
+        e2.Linha.DefinirFim(3.0);
+        e2.Salvar(true);
+        Ok(Esperar(delegate { return e2.IsDisposed || !e2.Visible; }, 30000), "editor 2 substituiu e fechou");
+        Ok(e2.UltimoSalvo == copia && File.Exists(copia) && Math.Abs(DuracaoExata(copia) - 3.0) < 0.12, "original trocado pelo corte: " + DuracaoExata(copia).ToString("0.00"));
+        Ok(Directory.GetFiles(pasta, ".*-editando.mp4").Length == 0, "nao sobrou arquivo temporario");
+    }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool PrintWindow(IntPtr h, IntPtr dc, uint flags);
+
+    static bool NomeNovoSegue(string clipe)
+    {
+        string n = CorteClipe.NomeNovo(clipe);
+        return Path.GetFileName(n) == "clipe-teste-corte2.mp4";
+    }
+
     // Pisca um quadrado branco no canto da tela principal e toca um bipe de
     // 4 kHz ao mesmo tempo, 3 vezes. O clipe mostra se o som esta no compasso.
     static byte[] Bipe()
@@ -1048,6 +1230,13 @@ static class Teste
             Console.WriteLine(falhas == 0 ? "TUDO OK" : "FALHAS: " + falhas);
             Environment.Exit(falhas == 0 ? 0 : 1);
         }
+        if (args.Length > 1 && args[1] == "editor")
+        {
+            TestarEditorClipe(saida);
+            Console.WriteLine(falhas == 0 ? "TUDO OK" : "FALHAS: " + falhas);
+            Environment.Exit(falhas == 0 ? 0 : 1);
+        }
+
         // Desenha o emoji do icone com o motor do programa (para gerar o icone.ico)
         if (args.Length > 2 && args[1] == "emoji")
         {
