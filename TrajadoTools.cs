@@ -5962,6 +5962,47 @@ static class Ffmpeg
         }
     }
 
+    // Como o Rodar, mas conta o progresso (segundos ja escritos, pelo
+    // "-progress pipe:1") e pode ser cancelado no meio. -3 = cancelado.
+    public static int RodarComProgresso(string args, int msMax, Action<double> progresso, Func<bool> cancelar, out string saida)
+    {
+        saida = "";
+        if (Caminho == null) return -2;
+        using (Process p = new Process())
+        {
+            StringBuilder sb = new StringBuilder();
+            p.StartInfo = Info("-progress pipe:1 -nostats " + args, null);
+            p.StartInfo.RedirectStandardOutput = true;
+            p.ErrorDataReceived += delegate(object s, DataReceivedEventArgs e)
+            {
+                if (e.Data != null) lock (sb) if (sb.Length < 20000) sb.AppendLine(e.Data);
+            };
+            p.OutputDataReceived += delegate(object s, DataReceivedEventArgs e)
+            {
+                if (e.Data == null || progresso == null || !e.Data.StartsWith("out_time_us=")) return;
+                long us;
+                if (long.TryParse(e.Data.Substring(12), out us) && us >= 0)
+                    try { progresso(us / 1000000.0); } catch { }
+            };
+            p.Start();
+            Trabalho.Prender(p);
+            p.BeginErrorReadLine();
+            p.BeginOutputReadLine();
+            Stopwatch relogio = Stopwatch.StartNew();
+            bool cancelou = false, terminou = false;
+            while (!(terminou = p.WaitForExit(200)))
+            {
+                if (cancelar != null && cancelar()) { cancelou = true; break; }
+                if (relogio.ElapsedMilliseconds > msMax) break;
+            }
+            if (!terminou) { try { p.Kill(); } catch { } }
+            p.WaitForExit(3000);
+            lock (sb) saida = sb.ToString();
+            if (cancelou) return -3;
+            return terminou ? p.ExitCode : -1;
+        }
+    }
+
     // Ultima linha util do que o ffmpeg escreveu, sem o "[ddagrab @ 0x...]"
     public static string Resumo(string saida)
     {
@@ -7910,51 +7951,77 @@ static class CorteClipe
     // so = o corte de sempre, sem recodificar. Mais de um = recodifica, porque
     // a emenda precisa cair no quadro exato (sem recodificar, cada trecho teria
     // de comecar num quadro-chave e a remocao "comeria" ate 1 s a mais).
-    // Tenta a placa de video (NVENC/AMF/QSV) e cai no libx264 se ela recusar.
-    public static string ExportarTrechos(string entrada, string saida, List<double[]> trechos, int volume, bool mudo)
+    //
+    // v2.2 (27/11/2026): numa gravacao de 5 min 42 s a v2.1 levou 102 s, sem
+    // progresso na tela, e o dono achou que tinha travado. O gargalo era o
+    // NVENC no preset p5 (3x o tempo real), nao a decodificacao. Agora:
+    // decodifica e codifica na placa (CUDA + NVENC p2) = 29 s no mesmo arquivo,
+    // com a mesma qualidade medida (SSIM 0,9976 nos dois). progresso recebe
+    // 0..1; cancelado() interrompe. Outro codificador so e tentado quando o
+    // anterior recusa logo de cara (nunca depois de rodar minutos).
+    public static string ExportarTrechos(string entrada, string saida, List<double[]> trechos, int volume, bool mudo,
+                                         Action<double> progresso = null, Func<bool> cancelado = null)
     {
         if (trechos == null || trechos.Count == 0) return "não sobrou nada do vídeo";
         if (trechos.Count == 1) return Exportar(entrada, saida, trechos[0][0], trechos[0][1], volume, mudo);
         if (Ffmpeg.Caminho == null) return "falta o ffmpeg";
         bool comSom = !mudo && TemSom(entrada);
+        double total = 0;
+        foreach (double[] t in trechos) total += t[1] - t[0];
         string ultimoErro = null;
-        foreach (string enc in CodificadoresParaEmenda())
+        foreach (string[] tentativa in TentativasDeEmenda())
         {
+            string enc = tentativa[0];
+            bool naPlaca = tentativa[1] == "cuda";
             string saidaTxt;
-            int cod = Ffmpeg.Rodar(ArgumentosTrechos(entrada, saida, trechos, volume, comSom, enc), null, 3600000, out saidaTxt);
+            Stopwatch relogio = Stopwatch.StartNew();
+            int cod = Ffmpeg.RodarComProgresso(ArgumentosTrechos(entrada, saida, trechos, volume, comSom, enc, naPlaca), 3600000,
+                delegate(double seg) { if (progresso != null && total > 0) progresso(Math.Min(1, seg / total)); },
+                cancelado, out saidaTxt);
             if (cod == 0 && File.Exists(saida) && new FileInfo(saida).Length > 0) return null;
-            App.Log("Erro ao emendar os trechos com " + enc + " (" + cod + "): " + saidaTxt);
-            ultimoErro = Ffmpeg.Resumo(saidaTxt) ?? "erro " + cod;
             try { if (File.Exists(saida)) File.Delete(saida); } catch { }
+            if (cod == -3) return "cancelado";
+            App.Log("Erro ao emendar os trechos com " + enc + (naPlaca ? " (CUDA)" : "") + " (" + cod + "): " + saidaTxt);
+            ultimoErro = Ffmpeg.Resumo(saidaTxt) ?? "erro " + cod;
+            if (relogio.ElapsedMilliseconds > 15000) break;   // rodou de verdade e falhou: nao recomeca tudo com outro
         }
         return ultimoErro;
     }
 
-    // O codificador do replay primeiro (ja se sabe que funciona neste PC),
-    // depois os outros de placa e, por ultimo, o do processador
-    static List<string> CodificadoresParaEmenda()
+    // {codificador, "cuda" ou ""}: o do replay primeiro (ja se sabe que
+    // funciona neste PC); NVENC tenta antes com a decodificacao na placa
+    static List<string[]> TentativasDeEmenda()
     {
-        List<string> l = new List<string>();
+        List<string> encs = new List<string>();
         string emUso = Replay.Codificador;
-        if (emUso != null && emUso.StartsWith("h264")) l.Add(emUso);
-        foreach (string e in new[] { "h264_nvenc", "h264_amf", "h264_qsv", "libx264" }) if (!l.Contains(e)) l.Add(e);
+        if (emUso != null && emUso.StartsWith("h264")) encs.Add(emUso);
+        foreach (string e in new[] { "h264_nvenc", "h264_amf", "h264_qsv", "libx264" }) if (!encs.Contains(e)) encs.Add(e);
+        List<string[]> l = new List<string[]>();
+        foreach (string e in encs)
+        {
+            if (e.EndsWith("_nvenc")) l.Add(new[] { e, "cuda" });
+            l.Add(new[] { e, "" });
+        }
         return l;
     }
 
     static string ArgsQualidade(string enc)
     {
-        if (enc.EndsWith("_nvenc")) return "-c:v " + enc + " -preset p5 -tune hq -rc vbr -cq 19 -b:v 0 ";
-        if (enc.EndsWith("_amf")) return "-c:v " + enc + " -quality quality -rc cqp -qp_i 18 -qp_p 20 ";
-        if (enc.EndsWith("_qsv")) return "-c:v " + enc + " -global_quality 20 ";
+        if (enc.EndsWith("_nvenc")) return "-c:v " + enc + " -preset p2 -rc vbr -cq 19 -b:v 0 ";
+        if (enc.EndsWith("_amf")) return "-c:v " + enc + " -quality speed -rc cqp -qp_i 18 -qp_p 20 ";
+        if (enc.EndsWith("_qsv")) return "-c:v " + enc + " -preset veryfast -global_quality 20 ";
         return "-c:v libx264 -preset veryfast -crf 18 ";
     }
 
-    public static string ArgumentosTrechos(string entrada, string saida, List<double[]> trechos, int volume, bool comSom, string enc)
+    public static string ArgumentosTrechos(string entrada, string saida, List<double[]> trechos, int volume, bool comSom, string enc, bool naPlaca = false)
     {
         // Pula direto para o primeiro trecho (numa gravacao longa nao decodifica
         // o comeco a toa); os tempos dos filtros ficam relativos a esse ponto
         double base0 = Math.Max(0, trechos[0][0] - 1);
         StringBuilder a = new StringBuilder("-hide_banner -loglevel error -nostdin -y ");
+        // na placa: os quadros nem saem da memoria de video (trim/concat so
+        // mexem no tempo, aceitam quadro CUDA)
+        if (naPlaca) a.Append("-hwaccel cuda -hwaccel_output_format cuda ");
         if (base0 > 0) a.Append("-ss ").Append(Num(base0)).Append(' ');
         a.Append("-i ").Append(Ffmpeg.Aspas(entrada)).Append(' ');
         StringBuilder f = new StringBuilder();
@@ -7977,7 +8044,9 @@ static class CorteClipe
         a.Append("-filter_complex \"").Append(f).Append("\" -map \"[vv]\" ");
         if (comSom) a.Append("-map \"[").Append(volume != 100 ? "ab" : "aa").Append("]\" -c:a aac -b:a 192k ");
         else a.Append("-an ");
-        a.Append(ArgsQualidade(enc)).Append("-pix_fmt yuv420p -movflags +faststart ").Append(Ffmpeg.Aspas(saida));
+        a.Append(ArgsQualidade(enc));
+        if (!naPlaca) a.Append("-pix_fmt yuv420p ");
+        a.Append("-movflags +faststart ").Append(Ffmpeg.Aspas(saida));
         return a.ToString();
     }
 
@@ -8392,11 +8461,11 @@ class EditorClipe : Form
 
         Label marcarIni = Botao("Início aqui", 96, "Começar o corte no cursor (I)");
         marcarIni.Location = new Point(280, y);
-        marcarIni.Click += delegate { linha.DefinirInicio(linha.Posicao); };
+        marcarIni.Click += delegate { if (!salvando) linha.DefinirInicio(linha.Posicao); };
         baseP.Controls.Add(marcarIni);
         Label marcarFim = Botao("Fim aqui", 84, "Terminar o corte no cursor (O)");
         marcarFim.Location = new Point(380, y);
-        marcarFim.Click += delegate { linha.DefinirFim(linha.Posicao); };
+        marcarFim.Click += delegate { if (!salvando) linha.DefinirFim(linha.Posicao); };
         baseP.Controls.Add(marcarFim);
 
         // Remover um pedaco do meio: 1o clique marca o comeco, o 2o o fim
@@ -8406,7 +8475,7 @@ class EditorClipe : Form
         baseP.Controls.Add(botaoRemover);
         botaoDesfazer = Botao("Desfazer", 80, "Devolver o último trecho removido (Ctrl + Z)");
         botaoDesfazer.Location = new Point(604, y);
-        botaoDesfazer.Click += delegate { linha.DesfazerRemocao(); };
+        botaoDesfazer.Click += delegate { if (!salvando) linha.DesfazerRemocao(); };
         baseP.Controls.Add(botaoDesfazer);
 
         // Tela estreita (monitor em pe): o trecho e o som descem para uma segunda linha
@@ -8435,7 +8504,7 @@ class EditorClipe : Form
         baseP.Controls.Add(rotuloVolume);
         botaoMudo = Botao("Mudo", 64, "Tirar o som do clipe (M)");
         botaoMudo.Location = new Point(sx + 268, y2);
-        botaoMudo.Click += delegate { mudo = !mudo; Atualizar(); };
+        botaoMudo.Click += delegate { if (!salvando) { mudo = !mudo; Atualizar(); } };
         baseP.Controls.Add(botaoMudo);
 
         salvarNovo = Botao("Salvar como novo", 150, "Salva o trecho num arquivo novo, ao lado do original (Ctrl + S)");
@@ -8584,7 +8653,7 @@ class EditorClipe : Form
 
     void MarcarRemocao()
     {
-        if (!carregado) return;
+        if (!carregado || salvando) return;
         Pausar();
         linha.MarcarRemocao(linha.Posicao);
     }
@@ -8601,6 +8670,7 @@ class EditorClipe : Form
         botaoMudo.BackColor = mudo ? Tema.Selecao : Tema.Campo;
         int nRem = linha.Removidos.Count;
         trecho.Text = !carregado ? "Abrindo..."
+            : salvando ? TextoSalvando()
             : !double.IsNaN(linha.MarcaRemocao) ? "Removendo a partir de " + CorteClipe.Tempo(linha.MarcaRemocao) + " — vá até o fim e aperte R"
             : nRem == 0
             ? "Trecho: " + CorteClipe.Tempo(linha.Inicio) + " até " + CorteClipe.Tempo(linha.Fim) + Tema.Ponto +
@@ -8621,6 +8691,7 @@ class EditorClipe : Form
     protected override bool ProcessCmdKey(ref Message msg, Keys k)
     {
         double quadro = linha.Info != null && linha.Info.Quadro > 0 ? linha.Info.Quadro : 1 / 60.0;
+        if (salvando && k != Keys.Escape) return true;   // salvando: so o Esc (fechar/cancelar)
         switch (k)
         {
             case Keys.Escape:
@@ -8650,33 +8721,120 @@ class EditorClipe : Form
         botaoPlay.Text = "▶";
     }
 
+    // SALVANDO (v2.2): com trecho removido, uma gravacao longa leva dezenas de
+    // segundos. A tela mostra a porcentagem; fechar no meio pede uma segunda
+    // vez e cancela (antes a janela fechava, as remocoes sumiam e a resposta
+    // do salvamento derrubava o programa inteiro, em 27/11/2026). Cada
+    // salvamento tem o seu arquivo temporario: dois nunca escrevem no mesmo.
+    volatile bool cancelarSalvamento;
+    bool fecharDepoisDeCancelar;
+    DateTime pedidoParaFechar = DateTime.MinValue;
+    double progressoSalvar = -1;   // 0..1; -1 = sem conta (corte rapido)
+    bool emendando;
+
     public void Salvar(bool trocarOriginal)
     {
         if (!carregado || salvando) return;
         Pausar();
+        List<double[]> trechos = linha.Trechos();
+        if (trechos.Count == 0) return;
         salvando = true;
+        cancelarSalvamento = false;
+        fecharDepoisDeCancelar = false;
+        emendando = trechos.Count > 1;
+        progressoSalvar = emendando ? 0 : -1;
+        linha.Enabled = false;
         Atualizar();
         string destino = trocarOriginal
-            ? Path.Combine(Path.GetDirectoryName(arquivo), "." + Path.GetFileNameWithoutExtension(arquivo) + "-editando.mp4")
+            ? Path.Combine(Path.GetDirectoryName(arquivo), "." + Path.GetFileNameWithoutExtension(arquivo) + "-editando-" +
+                           Guid.NewGuid().ToString("N").Substring(0, 8) + ".mp4")
             : CorteClipe.NomeNovo(arquivo);
-        List<double[]> trechos = linha.Trechos();
         int vol = volume.Valor;
         bool semSom = mudo;
-        trecho.Text = trechos.Count > 1 ? "Salvando e emendando os trechos..." : "Salvando...";
         System.Threading.Thread t = new System.Threading.Thread(delegate()
         {
-            string erro = CorteClipe.ExportarTrechos(arquivo, destino, trechos, vol, semSom);
-            BeginInvoke((MethodInvoker)delegate { Salvou(erro, destino, trocarOriginal); });
+            string erro;
+            try
+            {
+                int ultimo = -1;
+                erro = CorteClipe.ExportarTrechos(arquivo, destino, trechos, vol, semSom,
+                    delegate(double p)
+                    {
+                        int pct = (int)(p * 100);
+                        if (pct == ultimo) return;
+                        ultimo = pct;
+                        NaJanela(delegate { progressoSalvar = p; Atualizar(); });
+                    },
+                    delegate { return cancelarSalvamento; });
+            }
+            catch (Exception ex) { erro = ex.Message; App.Log("Erro ao salvar o corte: " + ex); }
+            if (!NaJanela(delegate { Salvou(erro, destino, trocarOriginal); }))
+            {
+                // a janela sumiu (nao deveria): nada de arquivo temporario perdido
+                if (trocarOriginal) try { if (File.Exists(destino)) File.Delete(destino); } catch { }
+            }
         });
+        t.IsBackground = true;
         t.Start();
+    }
+
+    // Roda na thread da janela. false = a janela ja foi fechada (nunca deixa
+    // a excecao escapar: numa thread de fundo ela derruba o programa todo).
+    bool NaJanela(MethodInvoker acao)
+    {
+        try
+        {
+            if (IsDisposed || !IsHandleCreated) return false;
+            BeginInvoke(acao);
+            return true;
+        }
+        catch { return false; }
+    }
+
+    string TextoSalvando()
+    {
+        if (cancelarSalvamento) return "Cancelando...";
+        if (progressoSalvar < 0) return "Salvando...";
+        return "Salvando " + (int)(progressoSalvar * 100) + "%" + (emendando ? " (emendando os trechos)" : "") + Tema.Ponto + "Esc 2x cancela";
+    }
+
+    protected override void OnFormClosing(FormClosingEventArgs e)
+    {
+        if (salvando && (e.CloseReason == CloseReason.UserClosing || e.CloseReason == CloseReason.None))
+        {
+            e.Cancel = true;
+            if ((DateTime.Now - pedidoParaFechar).TotalSeconds < 4)
+            {
+                cancelarSalvamento = true;
+                fecharDepoisDeCancelar = true;
+                Atualizar();
+            }
+            else
+            {
+                pedidoParaFechar = DateTime.Now;
+                Aviso.Mostrar("Ainda salvando o vídeo", "Feche de novo em até 4 s para cancelar o salvamento", Tema.Perigo);
+            }
+            return;
+        }
+        if (salvando) cancelarSalvamento = true;   // o programa esta saindo
+        base.OnFormClosing(e);
     }
 
     void Salvou(string erro, string destino, bool trocarOriginal)
     {
         salvando = false;
+        linha.Enabled = true;
+        progressoSalvar = -1;
+        if (erro == "cancelado")
+        {
+            if (fecharDepoisDeCancelar) { Close(); return; }
+            Aviso.Mostrar("Salvamento cancelado", "As marcações continuam no editor", Tema.Perigo);
+            Atualizar();
+            return;
+        }
         if (erro != null)
         {
-            Aviso.Mostrar("Não deu para salvar o corte", erro, Tema.Perigo);
+            Aviso.Mostrar("Não deu para salvar o corte", erro + " — as marcações continuam no editor", Tema.Perigo);
             Atualizar();
             return;
         }

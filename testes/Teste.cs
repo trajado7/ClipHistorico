@@ -1058,7 +1058,7 @@ static class Teste
         e2.Salvar(true);
         Ok(Esperar(delegate { return e2.IsDisposed || !e2.Visible; }, 30000), "editor 2 substituiu e fechou");
         Ok(e2.UltimoSalvo == copia && File.Exists(copia) && Math.Abs(DuracaoExata(copia) - 3.0) < 0.12, "original trocado pelo corte: " + DuracaoExata(copia).ToString("0.00"));
-        Ok(Directory.GetFiles(pasta, ".*-editando.mp4").Length == 0, "nao sobrou arquivo temporario");
+        Ok(Directory.GetFiles(pasta, ".*-editando*.mp4").Length == 0, "nao sobrou arquivo temporario");
 
         TestarRemoverTrechos(pasta, clipe);
     }
@@ -1129,6 +1129,77 @@ static class Teste
         string feito = e.UltimoSalvo;
         Ok(feito != null && File.Exists(feito) && Math.Abs(DuracaoExata(feito) - 6) < 0.1,
            "remover: arquivo do editor com 6 s: " + (feito != null && File.Exists(feito) ? DuracaoExata(feito).ToString("0.00") : "?"));
+
+        TestarSalvamentoLongo(pasta);
+    }
+
+    // ---- v2.2: salvamento longo (progresso, cancelar, fechar no meio) ----
+    static void TestarSalvamentoLongo(string pasta)
+    {
+        string longo = Path.Combine(pasta, "longo.mp4");
+        string seg;
+        int c = Ffmpeg.Rodar("-hide_banner -loglevel error -nostdin -y -f lavfi -i testsrc2=s=1920x1080:r=60 -f lavfi -i sine=f=440:r=48000 -t 60 " +
+                             "-map 0:v -map 1:a -c:v h264_nvenc -preset p1 -b:v 20000k -g 60 -pix_fmt yuv420p -c:a aac -b:a 192k -movflags +faststart " +
+                             Ffmpeg.Aspas(longo), null, 180000, out seg);
+        Ok(c == 0 && File.Exists(longo), "longo: clipe de 60 s montado " + Ffmpeg.Resumo(seg));
+        List<double[]> ficam = new List<double[]> { new[] { 0.0, 20.0 }, new[] { 30.0, 60.0 } };
+
+        // a linha de comando usa a placa para decodificar e o preset rapido
+        string args = CorteClipe.ArgumentosTrechos(longo, "x.mp4", ficam, 100, true, "h264_nvenc", true);
+        Ok(args.Contains("-hwaccel cuda -hwaccel_output_format cuda") && args.Contains("-preset p2") && !args.Contains("-pix_fmt"),
+           "longo: decodifica e codifica na placa (p2)");
+
+        // progresso sobe e chega no fim
+        List<double> prog = new List<double>();
+        string saida1 = Path.Combine(pasta, "longo-sem-meio.mp4");
+        Stopwatch sw = Stopwatch.StartNew();
+        string erro = CorteClipe.ExportarTrechos(longo, saida1, ficam, 100, false, delegate(double p) { lock (prog) prog.Add(p); }, null);
+        Console.WriteLine("longo: emendou 50 s em " + sw.ElapsedMilliseconds + " ms, " + prog.Count + " avisos de progresso");
+        Ok(erro == null && Math.Abs(DuracaoExata(saida1) - 50) < 0.15, "longo: 50 s no arquivo: " + DuracaoExata(saida1).ToString("0.00") + " " + erro);
+        bool sobe = prog.Count >= 2;
+        for (int i = 1; sobe && i < prog.Count; i++) sobe = prog[i] >= prog[i - 1];
+        Ok(sobe && prog[prog.Count - 1] > 0.9, "longo: progresso sobe ate o fim (" + (prog.Count > 0 ? prog[prog.Count - 1].ToString("0.00") : "-") + ")");
+
+        // cancelar no meio: devolve "cancelado" e nao deixa arquivo
+        string saida2 = Path.Combine(pasta, "longo-cancelado.mp4");
+        double ultimo = 0;
+        erro = CorteClipe.ExportarTrechos(longo, saida2, ficam, 100, false, delegate(double p) { ultimo = p; }, delegate { return ultimo > 0.1; });
+        Ok(erro == "cancelado" && !File.Exists(saida2), "longo: cancelar para e apaga o pedaco: " + erro);
+
+        // editor: fechar uma vez durante o salvamento NAO fecha; acaba e substitui
+        string copia = Path.Combine(pasta, "longo-substituir.mp4");
+        File.Copy(longo, copia, true);
+        EditorClipe e = new EditorClipe(copia, new Rectangle(-4000, 0, 1920, 1000));
+        e.SemFoco = true;
+        e.Show();
+        Ok(Esperar(delegate { return e.Pronto; }, 15000), "longo: editor abriu");
+        if (!e.Pronto) { e.Close(); return; }
+        e.Linha.MarcarRemocao(20); e.Linha.MarcarRemocao(30);
+        e.Salvar(true);
+        Esperar(delegate { return false; }, 400);
+        e.Close();   // um pedido so: so avisa
+        Application.DoEvents();
+        Ok(!e.IsDisposed && e.Visible && e.Salvando, "longo: fechar uma vez durante o salvamento nao fecha");
+        Ok(Esperar(delegate { return e.IsDisposed || !e.Visible; }, 120000), "longo: terminou e fechou");
+        Ok(e.UltimoSalvo == copia && Math.Abs(DuracaoExata(copia) - 50) < 0.15, "longo: original trocado (50 s): " + DuracaoExata(copia).ToString("0.00"));
+
+        // editor: fechar duas vezes = cancela, fecha e o original fica intacto
+        string copia2 = Path.Combine(pasta, "longo-cancelar.mp4");
+        File.Copy(longo, copia2, true);
+        long tamAntes = new FileInfo(copia2).Length;
+        EditorClipe e2 = new EditorClipe(copia2, new Rectangle(-4000, 0, 1920, 1000));
+        e2.SemFoco = true;
+        e2.Show();
+        Ok(Esperar(delegate { return e2.Pronto; }, 15000), "longo: editor 2 abriu");
+        if (!e2.Pronto) { e2.Close(); return; }
+        e2.Linha.MarcarRemocao(20); e2.Linha.MarcarRemocao(30);
+        e2.Salvar(true);
+        Esperar(delegate { return false; }, 400);
+        e2.Close(); Application.DoEvents(); e2.Close();
+        Ok(Esperar(delegate { return e2.IsDisposed || !e2.Visible; }, 30000), "longo: fechar 2x cancela e fecha");
+        Ok(File.Exists(copia2) && new FileInfo(copia2).Length == tamAntes, "longo: original intacto depois de cancelar");
+        Esperar(delegate { return false; }, 500);
+        Ok(Directory.GetFiles(pasta, ".*-editando*.mp4").Length == 0, "longo: nenhum temporario sobrou");
     }
 
     [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool PrintWindow(IntPtr h, IntPtr dc, uint flags);
