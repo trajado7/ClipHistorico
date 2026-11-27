@@ -7906,6 +7906,89 @@ static class CorteClipe
         return Ffmpeg.Resumo(saidaTxt) ?? "erro " + cod;
     }
 
+    // VARIOS TRECHOS (v2.1): o video com pedacos do meio removidos. Um trecho
+    // so = o corte de sempre, sem recodificar. Mais de um = recodifica, porque
+    // a emenda precisa cair no quadro exato (sem recodificar, cada trecho teria
+    // de comecar num quadro-chave e a remocao "comeria" ate 1 s a mais).
+    // Tenta a placa de video (NVENC/AMF/QSV) e cai no libx264 se ela recusar.
+    public static string ExportarTrechos(string entrada, string saida, List<double[]> trechos, int volume, bool mudo)
+    {
+        if (trechos == null || trechos.Count == 0) return "não sobrou nada do vídeo";
+        if (trechos.Count == 1) return Exportar(entrada, saida, trechos[0][0], trechos[0][1], volume, mudo);
+        if (Ffmpeg.Caminho == null) return "falta o ffmpeg";
+        bool comSom = !mudo && TemSom(entrada);
+        string ultimoErro = null;
+        foreach (string enc in CodificadoresParaEmenda())
+        {
+            string saidaTxt;
+            int cod = Ffmpeg.Rodar(ArgumentosTrechos(entrada, saida, trechos, volume, comSom, enc), null, 3600000, out saidaTxt);
+            if (cod == 0 && File.Exists(saida) && new FileInfo(saida).Length > 0) return null;
+            App.Log("Erro ao emendar os trechos com " + enc + " (" + cod + "): " + saidaTxt);
+            ultimoErro = Ffmpeg.Resumo(saidaTxt) ?? "erro " + cod;
+            try { if (File.Exists(saida)) File.Delete(saida); } catch { }
+        }
+        return ultimoErro;
+    }
+
+    // O codificador do replay primeiro (ja se sabe que funciona neste PC),
+    // depois os outros de placa e, por ultimo, o do processador
+    static List<string> CodificadoresParaEmenda()
+    {
+        List<string> l = new List<string>();
+        string emUso = Replay.Codificador;
+        if (emUso != null && emUso.StartsWith("h264")) l.Add(emUso);
+        foreach (string e in new[] { "h264_nvenc", "h264_amf", "h264_qsv", "libx264" }) if (!l.Contains(e)) l.Add(e);
+        return l;
+    }
+
+    static string ArgsQualidade(string enc)
+    {
+        if (enc.EndsWith("_nvenc")) return "-c:v " + enc + " -preset p5 -tune hq -rc vbr -cq 19 -b:v 0 ";
+        if (enc.EndsWith("_amf")) return "-c:v " + enc + " -quality quality -rc cqp -qp_i 18 -qp_p 20 ";
+        if (enc.EndsWith("_qsv")) return "-c:v " + enc + " -global_quality 20 ";
+        return "-c:v libx264 -preset veryfast -crf 18 ";
+    }
+
+    public static string ArgumentosTrechos(string entrada, string saida, List<double[]> trechos, int volume, bool comSom, string enc)
+    {
+        // Pula direto para o primeiro trecho (numa gravacao longa nao decodifica
+        // o comeco a toa); os tempos dos filtros ficam relativos a esse ponto
+        double base0 = Math.Max(0, trechos[0][0] - 1);
+        StringBuilder a = new StringBuilder("-hide_banner -loglevel error -nostdin -y ");
+        if (base0 > 0) a.Append("-ss ").Append(Num(base0)).Append(' ');
+        a.Append("-i ").Append(Ffmpeg.Aspas(entrada)).Append(' ');
+        StringBuilder f = new StringBuilder();
+        StringBuilder juntar = new StringBuilder();
+        for (int i = 0; i < trechos.Count; i++)
+        {
+            string ini = Num(trechos[i][0] - base0), fim = Num(trechos[i][1] - base0);
+            f.Append("[0:v:0]trim=start=").Append(ini).Append(":end=").Append(fim).Append(",setpts=PTS-STARTPTS[v").Append(i).Append("];");
+            juntar.Append("[v").Append(i).Append(']');
+            if (comSom)
+            {
+                f.Append("[0:a:0]atrim=start=").Append(ini).Append(":end=").Append(fim).Append(",asetpts=PTS-STARTPTS[a").Append(i).Append("];");
+                juntar.Append("[a").Append(i).Append(']');
+            }
+        }
+        f.Append(juntar).Append("concat=n=").Append(trechos.Count).Append(":v=1:a=").Append(comSom ? 1 : 0);
+        f.Append(comSom ? "[vv][aa]" : "[vv]");
+        if (comSom && volume != 100)
+            f.Append(";[aa]volume=").Append((volume / 100.0).ToString("0.00", CultureInfo.InvariantCulture)).Append("[ab]");
+        a.Append("-filter_complex \"").Append(f).Append("\" -map \"[vv]\" ");
+        if (comSom) a.Append("-map \"[").Append(volume != 100 ? "ab" : "aa").Append("]\" -c:a aac -b:a 192k ");
+        else a.Append("-an ");
+        a.Append(ArgsQualidade(enc)).Append("-pix_fmt yuv420p -movflags +faststart ").Append(Ffmpeg.Aspas(saida));
+        return a.ToString();
+    }
+
+    // O arquivo tem trilha de som? (o ffmpeg lista as trilhas ao abrir)
+    public static bool TemSom(string arquivo)
+    {
+        string s;
+        Ffmpeg.Rodar("-hide_banner -nostdin -i " + Ffmpeg.Aspas(arquivo), null, 30000, out s);
+        return s != null && s.Contains("Audio:");
+    }
+
     // Faixa de miniaturas para a linha do tempo, num ffmpeg so: cada entrada
     // pula direto para um ponto (rapido mesmo numa gravacao de 1 hora)
     public static Bitmap Miniaturas(string arquivo, double duracao, int quantas, int altura)
@@ -7952,9 +8035,17 @@ class LinhaDoTempo : Control
     public CorteClipe.Info Info;
     public Bitmap Faixa;
     public double Duracao = 1, Inicio, Fim = 1, Posicao;
-    public event Action Mudou;            // inicio ou fim
+    public event Action Mudou;            // inicio, fim ou trechos removidos
     public event Action<double> Buscou;   // clicou ou arrastou o cursor
     public const double Minimo = 0.5;     // trecho mais curto
+
+    // TRECHOS REMOVIDOS (v2.1, 27/11/2026): pedacos do meio que saem do video,
+    // em ordem e sem sobreposicao. MarcaRemocao = inicio de uma remocao que
+    // ainda espera o fim (NaN = nenhuma).
+    public readonly List<double[]> Removidos = new List<double[]>();
+    public double MarcaRemocao = double.NaN;
+    readonly List<double[]> ordemRemocoes = new List<double[]>();   // para o desfazer
+    public const double MinimoRemovido = 0.05;
 
     int arrastando;   // 0 nada, 1 inicio, 2 fim, 3 cursor
     const int Margem = 14;
@@ -7995,6 +8086,34 @@ class LinhaDoTempo : Control
             g.DrawLine(borda, xi, r.Y + 1, xf, r.Y + 1);
             g.DrawLine(borda, xi, r.Bottom - 2, xf, r.Bottom - 2);
         }
+        // Trechos removidos: vermelho riscado, com um X no meio
+        using (SolidBrush verm = new SolidBrush(Color.FromArgb(170, 150, 20, 30)))
+        using (HatchBrush risco = new HatchBrush(HatchStyle.WideDownwardDiagonal, Color.FromArgb(120, 255, 90, 90), Color.Transparent))
+        using (Pen bordaR = new Pen(Color.FromArgb(235, 255, 70, 70), 2))
+        using (Font fx = new Font("Segoe UI", 11f, FontStyle.Bold))
+        {
+            foreach (double[] rm in Removidos)
+            {
+                int a = X(rm[0]), b = Math.Max(X(rm[1]), X(rm[0]) + 2);
+                Rectangle q = new Rectangle(a, r.Y, b - a, r.Height);
+                g.FillRectangle(verm, q);
+                g.FillRectangle(risco, q);
+                g.DrawRectangle(bordaR, q);
+                if (q.Width >= 18)
+                    TextRenderer.DrawText(g, "✕", fx, q, Color.White, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+            }
+            // remocao comecada, esperando o fim
+            if (!double.IsNaN(MarcaRemocao))
+            {
+                int xm = X(MarcaRemocao);
+                g.DrawLine(bordaR, xm, r.Y - 4, xm, r.Bottom + 4);
+                int xp2 = X(Posicao);
+                if (xp2 != xm)
+                    using (SolidBrush prev = new SolidBrush(Color.FromArgb(90, 255, 60, 60)))
+                        g.FillRectangle(prev, Math.Min(xm, xp2), r.Y, Math.Abs(xp2 - xm), r.Height);
+            }
+        }
+
         Alca(g, xi, r, true);
         Alca(g, xf, r, false);
 
@@ -8019,6 +8138,8 @@ class LinhaDoTempo : Control
     protected override void OnMouseDown(MouseEventArgs e)
     {
         base.OnMouseDown(e);
+        // botao direito num trecho removido = devolve o trecho ao video
+        if (e.Button == MouseButtons.Right) { RestaurarEm(T(e.X)); return; }
         if (e.Button != MouseButtons.Left) return;
         int xi = X(Inicio), xf = X(Fim);
         if (e.X >= xi - 16 && e.X <= xi + 4) arrastando = 1;
@@ -8069,6 +8190,101 @@ class LinhaDoTempo : Control
         Invalidate();
         if (Mudou != null) Mudou();
     }
+
+    // Primeira vez marca o inicio da remocao; a segunda marca o fim e tira o
+    // pedaco. Devolve true quando um trecho entrou na lista.
+    public bool MarcarRemocao(double t)
+    {
+        t = Math.Max(0, Math.Min(Duracao, t));
+        if (double.IsNaN(MarcaRemocao)) { MarcaRemocao = t; Invalidate(); if (Mudou != null) Mudou(); return false; }
+        double a = Math.Min(MarcaRemocao, t), b = Math.Max(MarcaRemocao, t);
+        MarcaRemocao = double.NaN;
+        bool entrou = Remover(a, b);
+        Invalidate();
+        if (Mudou != null) Mudou();
+        return entrou;
+    }
+
+    public void CancelarMarca()
+    {
+        if (double.IsNaN(MarcaRemocao)) return;
+        MarcaRemocao = double.NaN;
+        Invalidate();
+        if (Mudou != null) Mudou();
+    }
+
+    // Junta com trechos que encostam ou se cruzam
+    public bool Remover(double a, double b)
+    {
+        a = Math.Max(0, a); b = Math.Min(Duracao, b);
+        if (b - a < MinimoRemovido) return false;
+        for (int i = Removidos.Count - 1; i >= 0; i--)
+        {
+            double[] r = Removidos[i];
+            if (r[1] < a || r[0] > b) continue;
+            a = Math.Min(a, r[0]); b = Math.Max(b, r[1]);
+            Removidos.RemoveAt(i);
+            ordemRemocoes.Remove(r);
+        }
+        double[] novo = { a, b };
+        Removidos.Add(novo);
+        Removidos.Sort((x, y) => x[0].CompareTo(y[0]));
+        ordemRemocoes.Add(novo);
+        return true;
+    }
+
+    public bool DesfazerRemocao()
+    {
+        if (!double.IsNaN(MarcaRemocao)) { CancelarMarca(); return true; }
+        if (ordemRemocoes.Count == 0) return false;
+        double[] r = ordemRemocoes[ordemRemocoes.Count - 1];
+        ordemRemocoes.RemoveAt(ordemRemocoes.Count - 1);
+        Removidos.Remove(r);
+        Invalidate();
+        if (Mudou != null) Mudou();
+        return true;
+    }
+
+    public bool RestaurarEm(double t)
+    {
+        double[] r = RemovidoEm(t);
+        if (r == null) return false;
+        Removidos.Remove(r);
+        ordemRemocoes.Remove(r);
+        Invalidate();
+        if (Mudou != null) Mudou();
+        return true;
+    }
+
+    // Trecho removido que contem t (null = nenhum)
+    public double[] RemovidoEm(double t)
+    {
+        foreach (double[] r in Removidos) if (t >= r[0] && t < r[1]) return r;
+        return null;
+    }
+
+    // O que vai para o arquivo: [Inicio, Fim] menos os trechos removidos
+    public List<double[]> Trechos()
+    {
+        List<double[]> ficam = new List<double[]>();
+        double ini = Inicio;
+        foreach (double[] r in Removidos)
+        {
+            if (r[1] <= ini || r[0] >= Fim) continue;
+            if (r[0] > ini) ficam.Add(new[] { ini, Math.Min(r[0], Fim) });
+            ini = Math.Max(ini, r[1]);
+        }
+        if (Fim > ini) ficam.Add(new[] { ini, Fim });
+        ficam.RemoveAll(x => x[1] - x[0] < MinimoRemovido);
+        return ficam;
+    }
+
+    public double DuracaoFinal()
+    {
+        double s = 0;
+        foreach (double[] x in Trechos()) s += x[1] - x[0];
+        return s;
+    }
 }
 
 // A janela do editor. O video toca num MediaElement do WPF, que usa o
@@ -8087,7 +8303,7 @@ class EditorClipe : Form
     readonly System.Windows.Forms.Integration.ElementHost host;
     readonly System.Windows.Controls.MediaElement video;
     readonly LinhaDoTempo linha;
-    readonly Label botaoPlay, tempo, trecho, rotuloVolume, botaoMudo, salvarNovo, substituir, aviso;
+    readonly Label botaoPlay, tempo, trecho, rotuloVolume, botaoMudo, salvarNovo, substituir, aviso, botaoRemover, botaoDesfazer;
     readonly Deslizador volume;
     readonly ToolTip dicas = new ToolTip();
     readonly Timer relogio;
@@ -8183,13 +8399,23 @@ class EditorClipe : Form
         marcarFim.Click += delegate { linha.DefinirFim(linha.Posicao); };
         baseP.Controls.Add(marcarFim);
 
+        // Remover um pedaco do meio: 1o clique marca o comeco, o 2o o fim
+        botaoRemover = Botao("Remover trecho", 130, "Tirar um pedaço do meio: marque o começo e depois o fim (R)");
+        botaoRemover.Location = new Point(470, y);
+        botaoRemover.Click += delegate { MarcarRemocao(); };
+        baseP.Controls.Add(botaoRemover);
+        botaoDesfazer = Botao("Desfazer", 80, "Devolver o último trecho removido (Ctrl + Z)");
+        botaoDesfazer.Location = new Point(604, y);
+        botaoDesfazer.Click += delegate { linha.DesfazerRemocao(); };
+        baseP.Controls.Add(botaoDesfazer);
+
         // Tela estreita (monitor em pe): o trecho e o som descem para uma segunda linha
-        bool estreito = largura < 1500;
-        int y2 = estreito ? y + 42 : y, sx = estreito ? 370 : 812;
+        bool estreito = largura < 1700;
+        int y2 = estreito ? y + 42 : y, sx = estreito ? 370 : 1040;
         if (estreito) baseP.Height = 206;
 
         trecho = Rotulo("", Tema.Normal, Tema.Suave);
-        trecho.SetBounds(estreito ? 24 : 476, y2, 330, 34);
+        trecho.SetBounds(estreito ? 24 : 692, y2, 330, 34);
         baseP.Controls.Add(trecho);
 
         Label som = Rotulo("Som", Tema.Negrito, Tema.Texto);
@@ -8227,7 +8453,7 @@ class EditorClipe : Form
         substituir.Click += delegate { Salvar(true); };
         baseP.Controls.Add(substituir);
 
-        aviso = Rotulo("Espaço toca  •  I e O marcam início e fim  •  ← → andam um quadro (Shift: 1 s)  •  o início encaixa no quadro-chave mais perto, para salvar sem perder qualidade",
+        aviso = Rotulo("Espaço toca  •  I e O marcam início e fim  •  R remove um trecho do meio (botão direito no vermelho devolve)  •  ← → andam um quadro (Shift: 1 s)",
                        Tema.Pequena, Tema.Suave);
         aviso.SetBounds(24, y2 + 40, largura - 48, 20);
         aviso.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
@@ -8325,6 +8551,7 @@ class EditorClipe : Form
         else
         {
             if (linha.Posicao < linha.Inicio || linha.Posicao >= linha.Fim - 0.05) Ir(linha.Inicio);
+            PularRemovido(linha.Posicao);
             video.Play();
             tocando = true;
             relogio.Start();
@@ -8338,9 +8565,28 @@ class EditorClipe : Form
         if (!tocando) return;
         double p = Posicao;
         if (p >= linha.Fim) { Ir(linha.Inicio); return; }
+        if (PularRemovido(p)) return;
         linha.Posicao = p;
         linha.Invalidate();
         AtualizarTempo();
+    }
+
+    // Tocando dentro de um trecho removido: pula para o fim dele (a previa
+    // mostra o video como vai ficar). true = pulou.
+    bool PularRemovido(double p)
+    {
+        double[] r = linha.RemovidoEm(p);
+        if (r == null) return false;
+        if (r[1] >= linha.Fim) { Ir(linha.Inicio); if (linha.RemovidoEm(linha.Inicio) != null) Ir(linha.RemovidoEm(linha.Inicio)[1]); return true; }
+        Ir(r[1]);
+        return true;
+    }
+
+    void MarcarRemocao()
+    {
+        if (!carregado) return;
+        Pausar();
+        linha.MarcarRemocao(linha.Posicao);
     }
 
     void AtualizarTempo()
@@ -8353,11 +8599,20 @@ class EditorClipe : Form
         video.Volume = mudo ? 0 : Math.Min(1.0, volume.Valor / 100.0);
         rotuloVolume.Text = mudo ? "mudo" : volume.Valor + "%";
         botaoMudo.BackColor = mudo ? Tema.Selecao : Tema.Campo;
-        trecho.Text = carregado
+        int nRem = linha.Removidos.Count;
+        trecho.Text = !carregado ? "Abrindo..."
+            : !double.IsNaN(linha.MarcaRemocao) ? "Removendo a partir de " + CorteClipe.Tempo(linha.MarcaRemocao) + " — vá até o fim e aperte R"
+            : nRem == 0
             ? "Trecho: " + CorteClipe.Tempo(linha.Inicio) + " até " + CorteClipe.Tempo(linha.Fim) + Tema.Ponto +
               (linha.Fim - linha.Inicio).ToString("0.0", CultureInfo.GetCultureInfo("pt-BR")) + " s"
-            : "Abrindo...";
-        bool mexeu = carregado && (linha.Inicio > 0.01 || linha.Fim < linha.Duracao - 0.01 || mudo || volume.Valor != 100);
+            : "Fica com " + linha.DuracaoFinal().ToString("0.0", CultureInfo.GetCultureInfo("pt-BR")) + " s" + Tema.Ponto +
+              nRem + (nRem == 1 ? " trecho removido" : " trechos removidos");
+        botaoRemover.Text = double.IsNaN(linha.MarcaRemocao) ? "Remover trecho" : "Fim da remoção";
+        botaoRemover.BackColor = double.IsNaN(linha.MarcaRemocao) ? Tema.Campo : Tema.Perigo;
+        bool podeDesfazer = nRem > 0 || !double.IsNaN(linha.MarcaRemocao);
+        botaoDesfazer.ForeColor = podeDesfazer ? Tema.Texto : Tema.Suave;
+        bool mexeu = carregado && linha.Trechos().Count > 0 &&
+                     (linha.Inicio > 0.01 || linha.Fim < linha.Duracao - 0.01 || mudo || volume.Valor != 100 || nRem > 0);
         salvarNovo.Enabled = substituir.Enabled = mexeu && !salvando;
         salvarNovo.ForeColor = substituir.ForeColor = mexeu && !salvando ? Tema.Texto : Tema.Suave;
         AtualizarTempo();
@@ -8368,7 +8623,11 @@ class EditorClipe : Form
         double quadro = linha.Info != null && linha.Info.Quadro > 0 ? linha.Info.Quadro : 1 / 60.0;
         switch (k)
         {
-            case Keys.Escape: Close(); return true;
+            case Keys.Escape:
+                if (!double.IsNaN(linha.MarcaRemocao)) { linha.CancelarMarca(); return true; }
+                Close(); return true;
+            case Keys.R: MarcarRemocao(); return true;
+            case Keys.Control | Keys.Z: linha.DesfazerRemocao(); return true;
             case Keys.Space: Alternar(); return true;
             case Keys.I: linha.DefinirInicio(linha.Posicao); return true;
             case Keys.O: linha.DefinirFim(linha.Posicao); return true;
@@ -8400,13 +8659,13 @@ class EditorClipe : Form
         string destino = trocarOriginal
             ? Path.Combine(Path.GetDirectoryName(arquivo), "." + Path.GetFileNameWithoutExtension(arquivo) + "-editando.mp4")
             : CorteClipe.NomeNovo(arquivo);
-        double ini = linha.Inicio, fim = linha.Fim;
+        List<double[]> trechos = linha.Trechos();
         int vol = volume.Valor;
         bool semSom = mudo;
-        trecho.Text = "Salvando...";
+        trecho.Text = trechos.Count > 1 ? "Salvando e emendando os trechos..." : "Salvando...";
         System.Threading.Thread t = new System.Threading.Thread(delegate()
         {
-            string erro = CorteClipe.Exportar(arquivo, destino, ini, fim, vol, semSom);
+            string erro = CorteClipe.ExportarTrechos(arquivo, destino, trechos, vol, semSom);
             BeginInvoke((MethodInvoker)delegate { Salvou(erro, destino, trocarOriginal); });
         });
         t.Start();
@@ -8477,7 +8736,7 @@ class EditorClipe : Form
         try { tam = new FileInfo(final).Length; } catch { }
         if (Config.SomAoCapturar) Som.Tocar();
         Aviso.Mostrar(trocarOriginal ? "Clipe substituído" : "Corte salvo",
-                      (linha.Fim - linha.Inicio).ToString("0.0", CultureInfo.GetCultureInfo("pt-BR")) + " s" + Tema.Ponto +
+                      linha.DuracaoFinal().ToString("0.0", CultureInfo.GetCultureInfo("pt-BR")) + " s" + Tema.Ponto +
                       Replay.Tamanho(tam) + Tema.Ponto + Path.GetFileName(final), Tema.Sucesso);
         voltarParaGaleria = true;
         Close();

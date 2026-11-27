@@ -1059,6 +1059,76 @@ static class Teste
         Ok(Esperar(delegate { return e2.IsDisposed || !e2.Visible; }, 30000), "editor 2 substituiu e fechou");
         Ok(e2.UltimoSalvo == copia && File.Exists(copia) && Math.Abs(DuracaoExata(copia) - 3.0) < 0.12, "original trocado pelo corte: " + DuracaoExata(copia).ToString("0.00"));
         Ok(Directory.GetFiles(pasta, ".*-editando.mp4").Length == 0, "nao sobrou arquivo temporario");
+
+        TestarRemoverTrechos(pasta, clipe);
+    }
+
+    // ---- v2.1: remover trechos do meio ----
+    static void TestarRemoverTrechos(string pasta, string clipe)
+    {
+        // Logica da linha do tempo (sem janela)
+        LinhaDoTempo l = new LinhaDoTempo();
+        l.Duracao = 8; l.Inicio = 0; l.Fim = 8;
+        Ok(!l.MarcarRemocao(2) && l.MarcaRemocao == 2, "remover: 1o aperto so marca o comeco");
+        Ok(l.MarcarRemocao(4) && l.Removidos.Count == 1 && double.IsNaN(l.MarcaRemocao), "remover: 2o aperto tira o trecho");
+        List<double[]> t = l.Trechos();
+        Ok(t.Count == 2 && t[0][0] == 0 && t[0][1] == 2 && t[1][0] == 4 && t[1][1] == 8, "remover: sobram 0-2 e 4-8");
+        Ok(Math.Abs(l.DuracaoFinal() - 6) < 1e-9, "remover: fica com 6 s");
+        l.MarcarRemocao(6); l.MarcarRemocao(5);   // de tras para frente tambem vale
+        Ok(l.Removidos.Count == 2 && l.Removidos[1][0] == 5 && l.Removidos[1][1] == 6, "remover: marcar ao contrario funciona");
+        l.Remover(3.5, 5.2);   // encosta nos dois: vira um so
+        Ok(l.Removidos.Count == 1 && l.Removidos[0][0] == 2 && l.Removidos[0][1] == 6, "remover: trechos que se cruzam viram um");
+        Ok(l.DesfazerRemocao() && l.Removidos.Count == 0, "remover: desfazer devolve");
+        l.Remover(1, 2); l.Remover(5, 7);
+        Ok(l.RestaurarEm(1.5) && l.Removidos.Count == 1 && l.Removidos[0][0] == 5, "remover: botao direito devolve o trecho clicado");
+        l.Inicio = 2; l.Fim = 6;   // corte nas pontas + remocao no meio
+        t = l.Trechos();
+        Ok(t.Count == 1 && t[0][0] == 2 && t[0][1] == 5, "remover: respeita inicio e fim do corte");
+        Ok(!l.Remover(3, 3.01), "remover: pedaco minusculo e ignorado");
+        l.MarcarRemocao(3); l.CancelarMarca();
+        Ok(double.IsNaN(l.MarcaRemocao) && l.Removidos.Count == 1, "remover: Esc cancela a marca");
+
+        // Arquivo: tira 2-4 s de um clipe de 8 s
+        List<double[]> ficam = new List<double[]> { new[] { 0.0, 2.0 }, new[] { 4.0, 8.0 } };
+        string sem = Path.Combine(pasta, "sem-meio.mp4");
+        Stopwatch sw = Stopwatch.StartNew();
+        string erro = CorteClipe.ExportarTrechos(clipe, sem, ficam, 100, false);
+        Console.WriteLine("emendou em " + sw.ElapsedMilliseconds + " ms");
+        Ok(erro == null, "remover: salvou sem erro: " + erro);
+        double d = DuracaoExata(sem);
+        Ok(Math.Abs(d - 6) < 0.1, "remover: arquivo com 6 s: " + d.ToString("0.00"));
+        string s = Sondar(sem);
+        Ok(s.Contains("Video: h264") && s.Contains("Audio: aac"), "remover: tem video e som");
+        string er;
+        int cod = Ffmpeg.Rodar("-hide_banner -v error -i " + Ffmpeg.Aspas(sem) + " -f null -", null, 60000, out er);
+        Ok(cod == 0 && er.Trim().Length == 0, "remover: decodifica sem erro: " + er);
+        // som e video com a mesma duracao (sem dessincronizar na emenda)
+        string sa;
+        Ffmpeg.Rodar("-hide_banner -nostdin -i " + Ffmpeg.Aspas(sem) + " -map 0:a -f null -", null, 60000, out sa);
+        int ia = sa.LastIndexOf("time=");
+        double dsom = -1;
+        TimeSpan ts;
+        if (ia >= 0 && TimeSpan.TryParse(sa.Substring(ia + 5, 11), System.Globalization.CultureInfo.InvariantCulture, out ts)) dsom = ts.TotalSeconds;
+        Ok(Math.Abs(dsom - 6) < 0.1, "remover: som tambem com 6 s: " + dsom.ToString("0.00"));
+        string mudo = Path.Combine(pasta, "sem-meio-mudo.mp4");
+        Ok(CorteClipe.ExportarTrechos(clipe, mudo, ficam, 100, true) == null && !Sondar(mudo).Contains("Audio:"), "remover: mudo sem som");
+        Ok(CorteClipe.ExportarTrechos(clipe, mudo, new List<double[]>(), 100, false) != null, "remover: nada sobrando da erro");
+
+        // A janela: remove 2-4 pelo R e salva
+        EditorClipe e = new EditorClipe(clipe, new Rectangle(-4000, 0, 1920, 1000));
+        e.SemFoco = true;
+        e.Show();
+        Ok(Esperar(delegate { return e.Pronto; }, 15000), "remover: editor abriu");
+        if (!e.Pronto) { e.Close(); return; }
+        e.Linha.MarcarRemocao(2.0);
+        e.Linha.MarcarRemocao(4.0);
+        Application.DoEvents();
+        using (Bitmap foto = e.Foto()) foto.Save(Path.Combine(pasta, "editor-removido.png"));
+        e.Salvar(false);
+        Ok(Esperar(delegate { return e.IsDisposed || !e.Visible; }, 60000), "remover: editor salvou e fechou");
+        string feito = e.UltimoSalvo;
+        Ok(feito != null && File.Exists(feito) && Math.Abs(DuracaoExata(feito) - 6) < 0.1,
+           "remover: arquivo do editor com 6 s: " + (feito != null && File.Exists(feito) ? DuracaoExata(feito).ToString("0.00") : "?"));
     }
 
     [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool PrintWindow(IntPtr h, IntPtr dc, uint flags);
